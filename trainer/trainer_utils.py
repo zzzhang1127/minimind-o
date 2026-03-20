@@ -74,7 +74,7 @@ def setup_seed(seed: int):
 
 def init_olm_model(
         olm_config,
-        from_weight='pretrain_olm',
+        from_weight='llm_768',
         tokenizer_path='../model',
         vision_model_path='../model/vision_model/clip-vit-base-patch16',
         save_dir='../out',
@@ -99,12 +99,21 @@ def init_olm_model(
 
     if from_weight != 'none':
         moe_suffix = '_moe' if olm_config.use_moe else ''
+        # Try standard naming first: {from_weight}_{hidden_size}.pth
         weight_path = f'{save_dir}/{from_weight}_{olm_config.hidden_size}{moe_suffix}.pth'
+        # If not found, try direct naming: {from_weight}.pth
+        if not os.path.exists(weight_path):
+            weight_path = f'{save_dir}/{from_weight}.pth'
+        
         if os.path.exists(weight_path):
             weights = torch.load(weight_path, map_location=device)
-            model.load_state_dict(weights, strict=False)
+            # Remove vision_encoder and speech_encoder from state_dict (will be reinitialized)
+            cleaned_weights = {k: v for k, v in weights.items() 
+                               if not k.startswith('vision_encoder.') and not k.startswith('speech_encoder.')}
+            model.load_state_dict(cleaned_weights, strict=False)
+            Logger(f'Loaded weights from: {weight_path}')
         else:
-            Logger(f'Weight not found, skip loading: {weight_path}')
+            Logger(f'Weight not found, skip loading. Searched paths: {weight_path}')
 
     if freeze_llm:
         for name, param in model.named_parameters():

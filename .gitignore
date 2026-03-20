@@ -21,3 +21,12 @@ swanlab/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Data and Model files
+dataset/short_wav/
+*.parquet
+*.jsonl
+*.pth
+*.bin
+speech_model/
+vision_model/

@@ -127,7 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="grad clip")
     parser.add_argument("--log_interval", type=int, default=50, help="log interval")
     parser.add_argument("--save_interval", type=int, default=500, help="save interval")
-    parser.add_argument('--hidden_size', default=512, type=int, help="hidden size")
+    parser.add_argument('--hidden_size', default=768, type=int, help="hidden size")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="num hidden layers")
     parser.add_argument('--max_seq_len', default=1536, type=int, help="max seq len")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="use moe")

@@ -8,11 +8,6 @@ from torch import nn
 from transformers import CLIPImageProcessor, CLIPModel
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
-try:
-    import whisper
-except ImportError:
-    whisper = None
-
 warnings.filterwarnings('ignore')
 
 
@@ -23,10 +18,12 @@ class OLMConfig(MiniMindConfig):
             self,
             image_special_token: str = '@' * 196,
             image_ids: List = [34] * 196,
-            speech_special_token: str = '#' * 100,
-            speech_ids: List = [35] * 100,
-            speech_encoder: str = 'base',
-            speech_encoder_ds_rate: int = 5,
+            speech_special_token: str = '#' * 150,
+            speech_ids: List = [5] * 150,
+            # Use local whisper-base by default (see get_speech_model).
+            speech_encoder: str = 'whisper-base',
+            # whisper encoder output length is 1500; compress to 150 by ds_rate=10.
+            speech_encoder_ds_rate: int = 10,
             speech_encoder_hidden_size: int = 512,
             **kwargs,
     ):
@@ -119,26 +116,33 @@ class MiniMindOLM(MiniMindForCausalLM):
 
     @staticmethod
     def get_speech_model(model_name: str):
-        if whisper is None:
-            return None
+        """
+        Load whisper encoder from local `model/speech_model/whisper-base` (or from a provided HF id/path).
+        We rely on HuggingFace's WhisperModel to match the expected output shape:
+        input_features: [B, 80, 3000] -> encoder_hidden: [B, 1500, 512]
+        """
+        from transformers import WhisperModel
 
-        def replace_layer_norm(module):
-            from whisper.model import LayerNorm
-            for name, child in module.named_children():
-                if isinstance(child, LayerNorm):
-                    old_params = child.state_dict()
-                    new_ln = nn.LayerNorm(
-                        child.normalized_shape,
-                        eps=child.eps,
-                        elementwise_affine=child.elementwise_affine,
-                    )
-                    new_ln.load_state_dict(old_params)
-                    setattr(module, name, new_ln)
-                else:
-                    replace_layer_norm(child)
+        candidate_paths = [
+            model_name,
+            # Local default path (minimind-o/model/speech_model/whisper-base)
+            os.path.join(os.path.dirname(__file__), 'speech_model', 'whisper-base'),
+            # Fallback relative paths (when cwd == trainer/)
+            "../model/speech_model/whisper-base",
+            "../minimind-o/model/speech_model/whisper-base",
+        ]
+        target_path = next((p for p in candidate_paths if isinstance(p, str) and os.path.exists(p)), None)
+        if target_path is None:
+            # Allow HF model id like "openai/whisper-base"
+            target_path = model_name
 
-        encoder = whisper.load_model(name=model_name, device='cpu').encoder
-        replace_layer_norm(encoder)
+        wm = WhisperModel.from_pretrained(target_path)
+        encoder = getattr(wm, "encoder", None)
+        if encoder is None and hasattr(wm, "model"):
+            encoder = getattr(wm.model, "encoder", None)
+        if encoder is None:
+            raise RuntimeError(f"Failed to resolve whisper encoder from: {target_path}")
+
         for param in encoder.parameters():
             param.requires_grad = False
         return encoder.eval()
@@ -152,12 +156,50 @@ class MiniMindOLM(MiniMindForCausalLM):
 
     @staticmethod
     def speech2tensor(audio_path, n_mels=128):
-        if whisper is None:
-            raise ImportError("whisper is required for speech preprocessing. Please install openai-whisper.")
-        speech = whisper.load_audio(audio_path)
-        speech = whisper.pad_or_trim(speech)
-        speech_tensor = whisper.log_mel_spectrogram(speech, n_mels=n_mels).permute(1, 0)
-        return speech_tensor
+        """
+        Convert a wav file into whisper input_features tensor.
+        Output is shaped as [T, 80] so that model forward can permute it to [B, 80, T].
+        """
+        from transformers import WhisperFeatureExtractor
+        import io
+        import wave
+        import numpy as np
+
+        # Decode wav bytes -> float32 mono
+        with open(audio_path, "rb") as f:
+            wav_bytes = f.read()
+
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sample_rate = wf.getframerate()
+            sample_width = wf.getsampwidth()
+            num_channels = wf.getnchannels()
+            n_frames = wf.getnframes()
+            pcm = wf.readframes(n_frames)
+
+        if sample_width != 2:
+            raise ValueError(f"Only 16-bit PCM wav is supported, got sample_width={sample_width}")
+
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if num_channels > 1:
+            audio = audio.reshape(-1, num_channels).mean(axis=1)
+
+        # Whisper expects 16kHz.
+        if sample_rate != 16000:
+            duration = len(audio) / sample_rate
+            target_len = int(duration * 16000)
+            audio = np.interp(
+                np.linspace(0, duration, target_len, endpoint=False),
+                np.linspace(0, duration, len(audio), endpoint=False),
+                audio,
+            )
+
+        # WhisperFeatureExtractor will generate [80, 3000]
+        extractor = WhisperFeatureExtractor.from_pretrained(
+            os.path.join(os.path.dirname(__file__), 'speech_model', 'whisper-base')
+        )
+        features = extractor(audio, sampling_rate=16000, return_tensors="pt").input_features  # [1, 80, 3000]
+        # Return [T, 80]
+        return features[0].transpose(0, 1).contiguous()
 
     @staticmethod
     def get_image_embeddings(image_tensors, vision_model):
@@ -170,7 +212,7 @@ class MiniMindOLM(MiniMindForCausalLM):
         with torch.no_grad():
             # [B, T, M] -> [B, M, T]
             outputs = speech_model(speech_tensors.permute(0, 2, 1))
-        return outputs
+            return outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs
 
     @staticmethod
     def _find_indices(tokens, target_ids):

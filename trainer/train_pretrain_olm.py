@@ -14,7 +14,7 @@ from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_olm import OLMConfig
-from dataset.lm_dataset import OLMDataset
+from dataset.pretrain_dataset import PretrainDataset
 from trainer.trainer_utils import (
     get_lr,
     Logger,
@@ -127,12 +127,12 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="grad clip")
     parser.add_argument("--log_interval", type=int, default=50, help="log interval")
     parser.add_argument("--save_interval", type=int, default=500, help="save interval")
-    parser.add_argument('--hidden_size', default=512, type=int, help="hidden size")
+    parser.add_argument('--hidden_size', default=768, type=int, help="hidden size")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="num hidden layers")
     parser.add_argument('--max_seq_len', default=768, type=int, help="max seq len")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="use moe")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_olm.parquet", help="train data path")
-    parser.add_argument('--from_weight', default='none', type=str, help="load from which weight")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_s2t.parquet", help="train data path")
+    parser.add_argument('--from_weight', default='llm_768', type=str, help="load from which weight")
     parser.add_argument('--train_modality', default='speech', type=str, choices=['speech', 'vision', 'both'], help="training modality")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="resume training")
     parser.add_argument('--freeze_llm', default=1, type=int, choices=[0, 1], help="freeze llm")
@@ -178,7 +178,7 @@ if __name__ == "__main__":
         model = torch.compile(model)
         Logger('torch.compile enabled')
 
-    train_ds = OLMDataset(
+    train_ds = PretrainDataset(
         args.data_path,
         tokenizer,
         preprocess=preprocess,
