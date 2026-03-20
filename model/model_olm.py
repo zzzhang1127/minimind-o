@@ -10,6 +10,21 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 warnings.filterwarnings('ignore')
 
+_WHISPER_FEATURE_EXTRACTOR = None
+
+
+def _get_whisper_feature_extractor():
+    """
+    Cache WhisperFeatureExtractor to avoid repeated disk IO.
+    """
+    global _WHISPER_FEATURE_EXTRACTOR
+    if _WHISPER_FEATURE_EXTRACTOR is None:
+        from transformers import WhisperFeatureExtractor
+        _WHISPER_FEATURE_EXTRACTOR = WhisperFeatureExtractor.from_pretrained(
+            os.path.join(os.path.dirname(__file__), 'speech_model', 'whisper-base')
+        )
+    return _WHISPER_FEATURE_EXTRACTOR
+
 
 class OLMConfig(MiniMindConfig):
     model_type = "minimind-o"
@@ -49,23 +64,24 @@ class VisionProj(nn.Module):
 
 
 class SpeechProj(nn.Module):
-    def __init__(self, speech_hidden_size=512, hidden_size=512, ds_rate=5):
+    def __init__(self, speech_hidden_size=512, hidden_size=512, ds_rate=10):
         super().__init__()
         self.k = ds_rate
-        self.linear1 = nn.Linear(speech_hidden_size * ds_rate, 2048)
-        self.relu = nn.ReLU()
-        self.linear2 = nn.Linear(2048, hidden_size)
+        # 1-layer audio projection: (compress time first, keep 512 dim) -> Linear(512 -> LM hidden)
+        self.linear = nn.Linear(speech_hidden_size, hidden_size, bias=True)
 
     def forward(self, x):
+        # x: [B, T(=1500), 512]
         batch_size, seq_len, dim = x.size()
         num_frames_to_discard = seq_len % self.k
         if num_frames_to_discard > 0:
             x = x[:, :-num_frames_to_discard, :]
-        x = x.contiguous().view(batch_size, x.size(1) // self.k, dim * self.k)
-        x = self.linear1(x)
-        x = self.relu(x)
-        x = self.linear2(x)
-        return x
+            seq_len = x.size(1)
+
+        # compress to [B, T/k (=150), 512]
+        x = x.contiguous().view(batch_size, seq_len // self.k, self.k, dim)  # [B,150,10,512]
+        x = x.mean(dim=2)  # no activation, keep pure compression
+        return self.linear(x)  # [B,150,LM_hidden]
 
 
 class MiniMindOLM(MiniMindForCausalLM):
@@ -102,7 +118,6 @@ class MiniMindOLM(MiniMindForCausalLM):
         candidate_paths = [
             model_path,
             "../model/vision_model/clip-vit-base-patch16",
-            "../minimind-v/model/vision_model/clip-vit-base-patch16",
         ]
         target_path = next((p for p in candidate_paths if os.path.exists(p)), None)
         if target_path is None:
@@ -155,12 +170,11 @@ class MiniMindOLM(MiniMindForCausalLM):
         return inputs
 
     @staticmethod
-    def speech2tensor(audio_path, n_mels=128):
+    def speech2tensor(audio_path):
         """
         Convert a wav file into whisper input_features tensor.
         Output is shaped as [T, 80] so that model forward can permute it to [B, 80, T].
         """
-        from transformers import WhisperFeatureExtractor
         import io
         import wave
         import numpy as np
@@ -194,9 +208,7 @@ class MiniMindOLM(MiniMindForCausalLM):
             )
 
         # WhisperFeatureExtractor will generate [80, 3000]
-        extractor = WhisperFeatureExtractor.from_pretrained(
-            os.path.join(os.path.dirname(__file__), 'speech_model', 'whisper-base')
-        )
+        extractor = _get_whisper_feature_extractor()
         features = extractor(audio, sampling_rate=16000, return_tensors="pt").input_features  # [1, 80, 3000]
         # Return [T, 80]
         return features[0].transpose(0, 1).contiguous()
@@ -246,12 +258,13 @@ class MiniMindOLM(MiniMindForCausalLM):
                 modal_hidden = modal_tensors[i][modal_idx]
                 span_len = end_idx - start_idx + 1
                 if modal_hidden.size(0) != span_len:
-                    modal_hidden = F.interpolate(
-                        modal_hidden.transpose(0, 1).unsqueeze(0),
-                        size=span_len,
-                        mode='linear',
-                        align_corners=False,
-                    ).squeeze(0).transpose(0, 1)
+                    # This should never happen if dataset/token placeholder construction is correct.
+                    # Interpolating silently would hide data bugs and produce wrong supervision.
+                    raise ValueError(
+                        f"modal token num mismatch: modal_hidden.size(0)={modal_hidden.size(0)} "
+                        f"vs placeholder span_len={span_len}. "
+                        f"Check placeholder tokenization/count and modal encoder/projection output length."
+                    )
                 h_i = torch.cat((h_i[:start_idx], modal_hidden, h_i[end_idx + 1:]), dim=0)[:seqlen]
                 modal_idx += 1
             new_h.append(h_i)
@@ -300,6 +313,25 @@ class MiniMindOLM(MiniMindForCausalLM):
             if len(speech_values.shape) == 3:
                 speech_values = speech_values.unsqueeze(1)
             bs, num, t, m = speech_values.shape
+            # If provided, use speech_lengths to mask out padded time steps.
+            # Whisper encoder doesn't take an attention mask here, so we zero out invalid frames.
+            if speech_lengths is not None:
+                # normalize shape to [bs, num]
+                if speech_lengths.dim() == 1:
+                    speech_lengths = speech_lengths.unsqueeze(1)
+                if speech_lengths.dim() == 2 and speech_lengths.size(1) == 1 and num > 1:
+                    speech_lengths = speech_lengths.expand(bs, num)
+                if speech_lengths.dim() != 2 or speech_lengths.size(0) != bs:
+                    raise ValueError(
+                        f"Invalid speech_lengths shape: expected [bs] or [bs, num], got {tuple(speech_lengths.shape)} "
+                        f"(bs={bs}, num={num})"
+                    )
+
+                speech_lengths = speech_lengths.to(speech_values.device).clamp(0, t)
+                time_ids = torch.arange(t, device=speech_values.device).view(1, 1, t)  # [1,1,t]
+                valid_mask = time_ids < speech_lengths.unsqueeze(-1)  # [bs,num,t] boolean
+                speech_values = speech_values.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
+
             speech_tensors = torch.stack([
                 MiniMindOLM.get_speech_embeddings(speech_values[:, i, :, :], self.speech_encoder)
                 for i in range(num)

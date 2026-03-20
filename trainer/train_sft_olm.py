@@ -133,7 +133,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="use moe")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_olm.parquet", help="train data path")
     parser.add_argument('--from_weight', default='pretrain_olm', type=str, help="load from which weight")
-    parser.add_argument('--train_modality', default='both', type=str, choices=['speech', 'vision', 'both'], help="training modality")
+    parser.add_argument('--mode', default='both', type=str, choices=['speech', 'vision', 'both'], help="training mode")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="resume training")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="use torch.compile")
     parser.add_argument("--use_wandb", action="store_true", help="use wandb")
@@ -171,7 +171,7 @@ if __name__ == "__main__":
         from_weight=args.from_weight,
         device=args.device,
         freeze_llm=False,
-        train_modality=args.train_modality,
+        mode=args.mode,
     )
     if args.use_compile == 1:
         model = torch.compile(model)

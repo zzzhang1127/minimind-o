@@ -65,12 +65,10 @@ cd trainer
 python train_pretrain_olm.py \
   --save_dir ../out \
   --save_weight pretrain_olm_test \
-  --from_weight sft_vlm \
   --data_path ../dataset/pretrain_s2t.parquet \
-  --train_modality speech \
+  --weight llm_768 \
+  --mode speech \
   --freeze_llm 1 \
-  --hidden_size 256 \
-  --num_hidden_layers 4 \
   --batch_size 4 \
   --epochs 1 \
   --log_interval 50 \

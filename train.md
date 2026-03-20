@@ -192,12 +192,10 @@ cd trainer
 python train_pretrain_olm.py ^
   --save_dir ../out ^
   --save_weight pretrain_olm ^
-  --from_weight sft_vlm ^
+  --weight sft_vlm ^
   --data_path ../dataset/pretrain_olm_speech.parquet ^
-  --train_modality speech ^
+  --mode speech ^
   --freeze_llm 1 ^
-  --hidden_size 512 ^
-  --num_hidden_layers 8 ^
   --batch_size 8 ^
   --epochs 4 ^
   --learning_rate 3e-4 ^
@@ -227,7 +225,7 @@ python train_sft_olm.py ^
   --save_weight sft_olm ^
   --from_weight pretrain_olm ^
   --data_path ../dataset/sft_olm.parquet ^
-  --train_modality both ^
+  --mode both ^
   --hidden_size 512 ^
   --num_hidden_layers 8 ^
   --batch_size 4 ^
@@ -243,15 +241,11 @@ python train_sft_olm.py ^
 3. SFT 学习率建议保守，避免能力漂移
 
 ### 4.3 如果你只想训练视觉
+预训练脚本 `train_pretrain_olm.py` 当前仅支持 `--mode speech`（用于语音投影对齐）。
+如果要训练视觉/多模态，请改用 SFT 脚本，例如：
 
 ~~~powershell
-python train_pretrain_olm.py --train_modality vision --freeze_llm 1 ...
-~~~
-
-SFT 同理：
-
-~~~powershell
-python train_sft_olm.py --train_modality vision ...
+python train_sft_olm.py --mode vision --freeze_llm 0 ...
 ~~~
 
 ---

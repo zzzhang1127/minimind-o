@@ -17,6 +17,8 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 from model.model_olm import MiniMindOLM
 
+WEIGHT_EXTS_PRIORITY = [".pth", ".bin", ".safetensors"]
+
 
 def get_model_params(model, config, ignore_patterns=None):
     if ignore_patterns is None:
@@ -80,14 +82,14 @@ def init_olm_model(
         save_dir='../out',
         device='cuda',
         freeze_llm=False,
-        train_modality='speech',
+        mode='speech',
 ):
-    train_modality = str(train_modality).lower()
-    if train_modality not in {'speech', 'vision', 'both'}:
-        raise ValueError(f'Invalid train_modality: {train_modality}. Choose from speech, vision, both.')
+    mode = str(mode).lower()
+    if mode not in {'speech', 'vision', 'both'}:
+        raise ValueError(f'Invalid mode: {mode}. Choose from speech, vision, both.')
 
-    load_vision_encoder = train_modality in {'vision', 'both'}
-    load_speech_encoder = train_modality in {'speech', 'both'}
+    load_vision_encoder = mode in {'vision', 'both'}
+    load_speech_encoder = mode in {'speech', 'both'}
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindOLM(
@@ -99,21 +101,54 @@ def init_olm_model(
 
     if from_weight != 'none':
         moe_suffix = '_moe' if olm_config.use_moe else ''
-        # Try standard naming first: {from_weight}_{hidden_size}.pth
-        weight_path = f'{save_dir}/{from_weight}_{olm_config.hidden_size}{moe_suffix}.pth'
-        # If not found, try direct naming: {from_weight}.pth
-        if not os.path.exists(weight_path):
-            weight_path = f'{save_dir}/{from_weight}.pth'
-        
-        if os.path.exists(weight_path):
-            weights = torch.load(weight_path, map_location=device)
+
+        def _maybe_extract_state_dict(obj) -> dict:
+            if isinstance(obj, dict):
+                if 'state_dict' in obj and isinstance(obj['state_dict'], dict):
+                    return obj['state_dict']
+                if 'model' in obj and isinstance(obj['model'], dict):
+                    return obj['model']
+                if any(torch.is_tensor(v) for v in obj.values()):
+                    return obj
+            raise ValueError("无法从权重中提取 state_dict")
+
+        def _load_weights(weight_file: str) -> dict:
+            ext = os.path.splitext(weight_file)[1].lower()
+            if ext == ".safetensors":
+                try:
+                    from safetensors.torch import load_file
+                except Exception as e:
+                    raise RuntimeError("加载 safetensors 权重需要安装 safetensors") from e
+                return load_file(weight_file, device="cpu")
+            raw = torch.load(weight_file, map_location=device)
+            return _maybe_extract_state_dict(raw)
+
+        # 1) explicit file path
+        from_path = str(from_weight)
+        if os.path.exists(from_path) and os.path.splitext(from_path)[1].lower() in WEIGHT_EXTS_PRIORITY:
+            weight_path = from_path
+        else:
+            # 2) search in save_dir
+            candidates = []
+            base1 = f'{from_weight}_{olm_config.hidden_size}{moe_suffix}'
+            base2 = f'{from_weight}'
+            for base in [base1, base2]:
+                for ext in WEIGHT_EXTS_PRIORITY:
+                    candidates.append(os.path.join(save_dir, base + ext))
+
+            weight_path = next((p for p in candidates if os.path.exists(p)), None)
+
+        if weight_path is not None:
+            weights = _load_weights(weight_path)
             # Remove vision_encoder and speech_encoder from state_dict (will be reinitialized)
-            cleaned_weights = {k: v for k, v in weights.items() 
-                               if not k.startswith('vision_encoder.') and not k.startswith('speech_encoder.')}
+            cleaned_weights = {
+                k: v for k, v in weights.items()
+                if not k.startswith('vision_encoder.') and not k.startswith('speech_encoder.')
+            }
             model.load_state_dict(cleaned_weights, strict=False)
             Logger(f'Loaded weights from: {weight_path}')
         else:
-            Logger(f'Weight not found, skip loading. Searched paths: {weight_path}')
+            Logger(f'Weight not found, skip loading (from_weight={from_weight}).')
 
     if freeze_llm:
         for name, param in model.named_parameters():
@@ -121,10 +156,10 @@ def init_olm_model(
                 param.requires_grad = False
 
     # Keep the inactive modality projector untouched during single-modality training.
-    if train_modality == 'speech':
+    if mode == 'speech':
         for param in model.vision_proj.parameters():
             param.requires_grad = False
-    elif train_modality == 'vision':
+    elif mode == 'vision':
         for param in model.speech_proj.parameters():
             param.requires_grad = False
 
@@ -134,7 +169,7 @@ def init_olm_model(
             param.requires_grad = True
 
     get_model_params(model, olm_config)
-    Logger(f'Train Modality: {train_modality} (vision_encoder={load_vision_encoder}, speech_encoder={load_speech_encoder})')
+    Logger(f'Mode: {mode} (vision_encoder={load_vision_encoder}, speech_encoder={load_speech_encoder})')
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     preprocess = model.processor
     return model.to(device), tokenizer, preprocess

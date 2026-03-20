@@ -201,12 +201,10 @@ cd trainer
 python train_pretrain_olm.py \
   --save_dir ../out \
   --save_weight pretrain_olm \
-  --from_weight sft_vlm \
   --data_path ../dataset/pretrain_s2t.parquet \
-  --train_modality speech \
+  --weight sft_vlm \
+  --mode speech \
   --freeze_llm 1 \
-  --hidden_size 512 \
-  --num_hidden_layers 8 \
   --batch_size 4 \
   --epochs 1 \
   --learning_rate 3e-4 \

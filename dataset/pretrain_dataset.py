@@ -60,22 +60,22 @@ class PretrainDataset(Dataset):
         tokenizer,
         preprocess=None,
         max_length: int = 768,
-        image_special_token: str = "@" * 196,
         speech_special_token: str = "#" * 150,
         prompt_text: str = "<speech>\nPlease transcribe the speech.",
-        n_mels: int = 80,
         fallback_speech_T: int = 3000,
     ):
         super().__init__()
         self.parquet_path = parquet_path
+        # NOTE: pyarrow.Table is generally not picklable on Windows spawn,
+        # so we keep it as a runtime cache and reload it inside workers when needed.
         self.table = pq.read_table(parquet_path, memory_map=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.preprocess = preprocess
-        self.image_token = image_special_token
         self.speech_token = speech_special_token
         self.prompt_text = prompt_text
-        self.n_mels = n_mels
+        # WhisperFeatureExtractor 默认 mel bins 固定为 80，这里保持一致。
+        self.n_mels = 80
         self.fallback_speech_T = fallback_speech_T
 
         self.columns = set(self.table.column_names)
@@ -92,6 +92,18 @@ class PretrainDataset(Dataset):
     def __len__(self):
         return len(self.table)
 
+    def __getstate__(self):
+        """
+        Ensure the dataset object can be pickled for DataLoader workers on Windows.
+        pyarrow.Table is not safely picklable, so drop it from the state and reload in __getitem__.
+        """
+        state = self.__dict__.copy()
+        state["table"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     def create_chat_prompt(self, transcript: str) -> str:
         conversations = [
             {"content": self.prompt_text},
@@ -100,7 +112,8 @@ class PretrainDataset(Dataset):
         messages = []
         for i, turn in enumerate(conversations):
             role = "user" if i % 2 == 0 else "assistant"
-            content = turn["content"].replace("<image>", self.image_token).replace("<speech>", self.speech_token)
+            # Speech pretrain: never insert image placeholder tokens.
+            content = turn["content"].replace("<speech>", self.speech_token)
             messages.append({"role": role, "content": content})
 
         return self.tokenizer.apply_chat_template(
@@ -167,7 +180,7 @@ class PretrainDataset(Dataset):
             return speech_tensor, speech_lengths
         except Exception:
             # Fallback: fixed-size zeros so training doesn't crash on a bad wav.
-            zeros = torch.zeros((self.fallback_speech_T, self.n_mels), dtype=torch.float32)
+            zeros = torch.zeros((self.fallback_speech_T, 80), dtype=torch.float32)
             lengths = torch.LongTensor([self.fallback_speech_T])
             return zeros, lengths
 
@@ -176,6 +189,9 @@ class PretrainDataset(Dataset):
         return torch.zeros((1, 1, 3, 224, 224), dtype=torch.float32)
 
     def __getitem__(self, index: int):
+        if self.table is None:
+            # Worker-safe lazy init
+            self.table = pq.read_table(self.parquet_path, memory_map=True)
         speech_bytes = self.table["speech_bytes"][index].as_py()
         transcript_bytes = self.table["transcript_bytes"][index].as_py()
         if speech_bytes is None or transcript_bytes is None:
