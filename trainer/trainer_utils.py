@@ -148,9 +148,10 @@ def olm_checkpoint(
         epoch=0,
         step=0,
         wandb=None,
-        save_dir='../checkpoint',
+        save_dir='../checkpoints',
         **kwargs,
 ):
+    # Always create new checkpoint directory for saving.
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if olm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{olm_config.hidden_size}{moe_path}.pth'
@@ -199,6 +200,12 @@ def olm_checkpoint(
         del state_dict, clean_state_dict, resume_data
         torch.cuda.empty_cache()
     else:
+        # Compatibility: if user previously saved to `checkpoint/`, try reading from it.
+        if not os.path.exists(resume_path):
+            legacy_resume_path = resume_path.replace(os.sep + "checkpoints" + os.sep, os.sep + "checkpoint" + os.sep)
+            if os.path.exists(legacy_resume_path):
+                resume_path = legacy_resume_path
+
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)

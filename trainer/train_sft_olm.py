@@ -104,7 +104,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir='../checkpoint',
+                save_dir='../checkpoints',
                 scaler=scaler,
             )
             model.train()
@@ -152,7 +152,7 @@ if __name__ == "__main__":
         max_seq_len=args.max_seq_len,
         use_moe=bool(args.use_moe),
     )
-    ckp_data = olm_checkpoint(olm_config, weight=args.save_weight, save_dir='../checkpoint') if args.from_resume == 1 else None
+    ckp_data = olm_checkpoint(olm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16

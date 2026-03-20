@@ -6,7 +6,7 @@
 1. 数据目录必须为 dataset/，数据处理文件为 dataset/lm_dataset.py（参考 minimind-v 同名文件写法）。
 1. 训练数据格式保持 Parquet 统一。
 1. 训练最终结果保存到 out/。
-1. 临时检查点保存到 checkpoint/（参数、优化器状态、断点续训信息）。
+1. 临时检查点保存到 checkpoints/（参数、优化器状态、断点续训信息）。
 1. 训练脚本必须放到 trainer/。
 1. 在 minimind-o 下新增 eval_olm.py 用于效果测试。
 1. 允许按 minimind-v 代码写法直接复用改造。
@@ -108,7 +108,7 @@
 - 风险控制：优先最小改造与分阶段冻结，先稳定功能再追求更高性能。
 
 **Implementation Checklist (execution order)**
-1. 目录搭建：model/、dataset/、trainer/、out/、checkpoint/。
+1. 目录搭建：model/、dataset/、trainer/、out/、checkpoints/。
 1. 模型搭建：model/model_olm.py（视觉+语音+文本统一前向）。
 1. 数据搭建：dataset/lm_dataset.py（Parquet读取、<image>/<speech>占位替换、标签构造）。
 1. 训练工具：trainer/trainer_utils.py（模型加载、参数统计、checkpoint保存与恢复）。

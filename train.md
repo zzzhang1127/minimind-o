@@ -271,7 +271,7 @@ out/{save_weight}_{hidden_size}{_moe可选}.pth
 保存在：
 
 ~~~text
-checkpoint/{save_weight}_{hidden_size}{_moe可选}_resume.pth
+checkpoints/{save_weight}_{hidden_size}{_moe可选}_resume.pth
 ~~~
 
 启用续训：
