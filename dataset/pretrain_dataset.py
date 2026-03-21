@@ -1,14 +1,13 @@
 import io
 import os
 import wave
-import json
+import random
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
 
 __package__ = "dataset"
@@ -17,10 +16,15 @@ __package__ = "dataset"
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model.model_olm import MiniMindOLM
-
 _WHISPER_BASE_DIR: Optional[str] = None
 _WHISPER_FEATURE_EXTRACTOR = None
+PROMPTS_ZH = [
+    "<speech>\n请转录这段语音。",
+    "<speech>\n识别以下音频内容：",
+    "<speech>\n这段话说了什么？",
+    "<speech>\n语音转文字：",
+    "<speech>\n请将语音转为文字：",
+]
 
 
 def _get_whisper_base_dir() -> str:
@@ -51,18 +55,24 @@ class PretrainDataset(Dataset):
       assistant: transcript text
 
     Then it returns:
-      (input_ids, labels, pixel_values, speech_values, speech_lengths)
+      (input_ids, labels, speech_values, speech_lengths)
+    仅语音：无图像、无 CLIP/像素输入，仅 mel 特征与文本 token。
+    若传入 preprocess / image_special_token（兼容旧脚本），会被忽略。
     """
 
     def __init__(
         self,
         parquet_path: str,
         tokenizer,
-        preprocess=None,
         max_length: int = 768,
         speech_special_token: str = "#" * 150,
-        prompt_text: str = "<speech>\nPlease transcribe the speech.",
+        prompt_text: str = "",
         fallback_speech_T: int = 3000,
+        enable_spec_augment: bool = True,
+        enable_wave_augment: bool = True,
+        # 以下为兼容旧调用（如 train_sft_olm / validate_data_flow），语音预训练不使用图像与 CLIP
+        preprocess=None,
+        image_special_token=None,
     ):
         super().__init__()
         self.parquet_path = parquet_path
@@ -71,12 +81,14 @@ class PretrainDataset(Dataset):
         self.table = pq.read_table(parquet_path, memory_map=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.preprocess = preprocess
         self.speech_token = speech_special_token
         self.prompt_text = prompt_text
         # WhisperFeatureExtractor 默认 mel bins 固定为 80，这里保持一致。
         self.n_mels = 80
         self.fallback_speech_T = fallback_speech_T
+        self.enable_spec_augment = enable_spec_augment
+        self.enable_wave_augment = enable_wave_augment
+        self.extractor = _get_whisper_feature_extractor()
 
         self.columns = set(self.table.column_names)
         if "speech_bytes" not in self.columns or "transcript_bytes" not in self.columns:
@@ -105,14 +117,14 @@ class PretrainDataset(Dataset):
         self.__dict__.update(state)
 
     def create_chat_prompt(self, transcript: str) -> str:
+        base_prompt = self.prompt_text if self.prompt_text else random.choice(PROMPTS_ZH)
         conversations = [
-            {"content": self.prompt_text},
+            {"content": base_prompt},
             {"content": transcript},
         ]
         messages = []
         for i, turn in enumerate(conversations):
             role = "user" if i % 2 == 0 else "assistant"
-            # Speech pretrain: never insert image placeholder tokens.
             content = turn["content"].replace("<speech>", self.speech_token)
             messages.append({"role": role, "content": content})
 
@@ -138,6 +150,9 @@ class PretrainDataset(Dataset):
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1
+        assert any(l != -100 for l in labels), (
+            "labels全为-100，assistant边界未找到，请检查tokenizer chat template格式。"
+        )
         return labels
 
     def _decode_wav_bytes_to_audio(self, wav_bytes: bytes) -> Tuple[np.ndarray, int]:
@@ -154,9 +169,43 @@ class PretrainDataset(Dataset):
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         if num_channels > 1:
             audio = audio.reshape(-1, num_channels).mean(axis=1)
+
+        # waveform-level augmentation
+        if self.enable_wave_augment:
+            if random.random() < 0.5:
+                audio = audio * np.random.uniform(0.8, 1.2)
+            if random.random() < 0.3:
+                audio = audio + (np.random.randn(len(audio)).astype(np.float32) * 0.005)
+            audio = np.clip(audio, -1.0, 1.0)
         return audio, sample_rate
 
-    def _speech_bytes_to_tensor(self, speech_bytes: bytes) -> Tuple[torch.Tensor, torch.LongTensor]:
+    @staticmethod
+    def _spec_augment(features: torch.Tensor) -> torch.Tensor:
+        """
+        features: [1, 80, 3000]
+        """
+        feat = features.clone()
+        n_mels = feat.size(1)
+        t_steps = feat.size(2)
+
+        # Frequency masking
+        for _ in range(2):
+            f = random.randint(0, min(15, n_mels))
+            if f == 0:
+                continue
+            f0 = random.randint(0, n_mels - f)
+            feat[0, f0:f0 + f, :] = 0
+
+        # Time masking
+        for _ in range(2):
+            t = random.randint(0, min(80, t_steps))
+            if t == 0:
+                continue
+            t0 = random.randint(0, t_steps - t)
+            feat[0, :, t0:t0 + t] = 0
+        return feat
+
+    def _speech_bytes_to_tensor(self, speech_bytes: bytes) -> Optional[Tuple[torch.Tensor, torch.LongTensor]]:
         """
         Return:
           speech_tensor: [T, 80] float32
@@ -173,20 +222,15 @@ class PretrainDataset(Dataset):
                     audio,
                 )
 
-            extractor = _get_whisper_feature_extractor()
-            features = extractor(audio, sampling_rate=16000, return_tensors="pt").input_features  # [1,80,3000]
+            features = self.extractor(audio, sampling_rate=16000, return_tensors="pt").input_features  # [1,80,3000]
+            if self.enable_spec_augment:
+                features = self._spec_augment(features)
             speech_tensor = features[0].transpose(0, 1).contiguous()  # [3000,80]
             speech_lengths = torch.LongTensor([speech_tensor.size(0)])
             return speech_tensor, speech_lengths
         except Exception:
-            # Fallback: fixed-size zeros so training doesn't crash on a bad wav.
-            zeros = torch.zeros((self.fallback_speech_T, 80), dtype=torch.float32)
-            lengths = torch.LongTensor([self.fallback_speech_T])
-            return zeros, lengths
-
-    def _dummy_image_tensor(self) -> torch.Tensor:
-        # Match previous OLMDataset's shape: [1, 1, 3, 224, 224]
-        return torch.zeros((1, 1, 3, 224, 224), dtype=torch.float32)
+            # Returning None is safer than injecting fake silent samples into training.
+            return None
 
     def __getitem__(self, index: int):
         if self.table is None:
@@ -195,26 +239,40 @@ class PretrainDataset(Dataset):
         speech_bytes = self.table["speech_bytes"][index].as_py()
         transcript_bytes = self.table["transcript_bytes"][index].as_py()
         if speech_bytes is None or transcript_bytes is None:
-            # Extremely defensive fallback
-            speech_tensor = torch.zeros((self.fallback_speech_T, self.n_mels), dtype=torch.float32)
-            speech_lengths = torch.LongTensor([self.fallback_speech_T])
-            transcript = ""
-        else:
-            transcript = transcript_bytes.decode("utf-8", errors="ignore")
-            speech_tensor, speech_lengths = self._speech_bytes_to_tensor(speech_bytes)
+            return None
+
+        transcript = transcript_bytes.decode("utf-8", errors="ignore")
+        speech_result = self._speech_bytes_to_tensor(speech_bytes)
+        if speech_result is None:
+            return None
+        speech_tensor, speech_lengths = speech_result
 
         prompt = self.create_chat_prompt(transcript)
         input_ids = self.tokenizer(prompt).input_ids[: self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         labels = self.generate_labels(input_ids)
 
-        pixel_values = self._dummy_image_tensor()
         speech_values = speech_tensor.unsqueeze(0)  # [1, T, 80]
         return (
             torch.tensor(input_ids, dtype=torch.long),
             torch.tensor(labels, dtype=torch.long),
-            pixel_values,
             speech_values,
             speech_lengths,
         )
+
+
+def pretrain_collate_fn(batch):
+    """
+    Filter invalid samples (None) and stack valid items.
+    """
+    batch = [x for x in batch if x is not None]
+    if len(batch) == 0:
+        return None
+    input_ids, labels, speech_values, speech_lengths = zip(*batch)
+    return (
+        torch.stack(input_ids, dim=0),
+        torch.stack(labels, dim=0),
+        torch.stack(speech_values, dim=0),
+        torch.stack(speech_lengths, dim=0),
+    )
 

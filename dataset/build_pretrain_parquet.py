@@ -2,6 +2,8 @@ import argparse
 import os
 import re
 import time
+import io
+import wave
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -58,10 +60,39 @@ def _iter_audio_folders(wave_root: Path) -> List[Path]:
     return folders
 
 
+def _validate_wav_bytes(wav_bytes: bytes, min_duration_sec: float = 0.5) -> tuple[bool, float, int]:
+    """
+    Validate wav integrity and basic quality.
+    Returns: (is_valid, duration_sec, sample_rate)
+    """
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sample_rate = wf.getframerate()
+            sample_width = wf.getsampwidth()
+            n_channels = wf.getnchannels()
+            n_frames = wf.getnframes()
+            _ = wf.readframes(n_frames)
+    except Exception:
+        return False, 0.0, 0
+
+    if sample_width != 2:
+        return False, 0.0, sample_rate
+    if n_channels <= 0 or sample_rate <= 0 or n_frames <= 0:
+        return False, 0.0, sample_rate
+    duration_sec = float(n_frames) / float(sample_rate)
+    if duration_sec < min_duration_sec:
+        return False, duration_sec, sample_rate
+    # Keep training-side resampling behavior simple: require canonical 16k in parquet.
+    if sample_rate != 16000:
+        return False, duration_sec, sample_rate
+    return True, duration_sec, sample_rate
+
+
 def build_pretrain_s2t_parquet(
     short_wav_root: str,
     output_parquet: str,
     chunk_size: int = 256,
+    min_duration_sec: float = 0.5,
 ) -> None:
     root = Path(short_wav_root)
     script_root = root / "SCRIPT"
@@ -94,6 +125,10 @@ def build_pretrain_s2t_parquet(
     total_pairs = 0
     missing_script = 0
     missing_text_line = 0
+    invalid_audio = 0
+    short_audio = 0
+    bad_sample_rate = 0
+    total_audio_duration_sec = 0.0
 
     t0 = time.time()
     try:
@@ -116,9 +151,23 @@ def build_pretrain_s2t_parquet(
                     missing_text_line += 1
                     continue
 
-                speech_buf.append(wav_path.read_bytes())
+                wav_bytes = wav_path.read_bytes()
+                valid, duration_sec, sample_rate = _validate_wav_bytes(
+                    wav_bytes,
+                    min_duration_sec=min_duration_sec,
+                )
+                if not valid:
+                    invalid_audio += 1
+                    if duration_sec > 0 and duration_sec < min_duration_sec:
+                        short_audio += 1
+                    elif sample_rate != 0 and sample_rate != 16000:
+                        bad_sample_rate += 1
+                    continue
+
+                speech_buf.append(wav_bytes)
                 text_buf.append(text.encode("utf-8"))
                 total_pairs += 1
+                total_audio_duration_sec += duration_sec
 
                 if len(speech_buf) >= chunk_size:
                     table = pa.table(
@@ -136,6 +185,7 @@ def build_pretrain_s2t_parquet(
                 print(
                     f"[Progress] folders={folder_idx}/{len(folders)} pairs={total_pairs} "
                     f"missing_script={missing_script} missing_text_line={missing_text_line} "
+                    f"invalid_audio={invalid_audio} short_audio={short_audio} bad_sr={bad_sample_rate} "
                     f"elapsed={elapsed/60:.1f}min"
                 )
 
@@ -153,8 +203,10 @@ def build_pretrain_s2t_parquet(
     print("\n[Done]")
     print(f"Output: {output_parquet}")
     print(f"Total pairs: {total_pairs}")
+    print(f"Total audio duration: {total_audio_duration_sec/3600:.2f} hours")
     print(f"Missing SCRIPT files: {missing_script}")
     print(f"Missing transcript lines for wavs: {missing_text_line}")
+    print(f"Invalid audio skipped: {invalid_audio} (short<{min_duration_sec}s: {short_audio}, bad_sr: {bad_sample_rate})")
 
 
 def main() -> None:
@@ -177,6 +229,12 @@ def main() -> None:
         default=256,
         help="Number of samples per row-group write",
     )
+    parser.add_argument(
+        "--min_duration_sec",
+        type=float,
+        default=0.5,
+        help="Skip wav shorter than this duration",
+    )
     args = parser.parse_args()
 
     dataset_dir = Path(__file__).resolve().parent
@@ -189,6 +247,7 @@ def main() -> None:
         short_wav_root=args.short_wav_root,
         output_parquet=args.output_parquet,
         chunk_size=args.chunk_size,
+        min_duration_sec=args.min_duration_sec,
     )
 
 

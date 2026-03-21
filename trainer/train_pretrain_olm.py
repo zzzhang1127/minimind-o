@@ -15,7 +15,7 @@ from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_olm import OLMConfig
-from dataset.pretrain_dataset import PretrainDataset
+from dataset.pretrain_dataset import PretrainDataset, pretrain_collate_fn
 from trainer.trainer_utils import (
     get_lr,
     Logger,
@@ -32,19 +32,31 @@ warnings.filterwarnings('ignore')
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
-    for step, (input_ids, labels, pixel_values, speech_values, speech_lengths) in enumerate(loader, start=start_step + 1):
+    for step, batch in enumerate(loader, start=start_step + 1):
+        if batch is None:
+            continue
+        input_ids, labels, speech_values, speech_lengths = batch
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         speech_values = speech_values.to(args.device)
         speech_lengths = speech_lengths.to(args.device)
 
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        cur_step = epoch * iters + step
+        total_steps = args.epochs * iters
+        if getattr(args, "_optimizer_grouped", False):
+            optimizer.param_groups[0]["lr"] = get_lr(
+                cur_step, total_steps, args.lr_speech_proj
+            )
+            optimizer.param_groups[1]["lr"] = get_lr(
+                cur_step, total_steps, args.lr_llm_last
+            )
+        else:
+            lr = get_lr(cur_step, total_steps, args.learning_rate)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
         with autocast_ctx:
-            # Speech pretrain: only feed speech encoder/projection into the model.
-            # Vision inputs are intentionally not used during this stage.
+            # 仅训练语音编码器输出 + speech_proj；不传入任何视觉输入。
             res = model(
                 input_ids,
                 labels=labels,
@@ -68,20 +80,33 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
-            current_lr = optimizer.param_groups[-1]['lr']
+            if getattr(args, "_optimizer_grouped", False):
+                current_lr = optimizer.param_groups[0]["lr"]
+                current_lr_llm = optimizer.param_groups[1]["lr"]
+            else:
+                current_lr = optimizer.param_groups[-1]["lr"]
+                current_lr_llm = None
             # Predicted total epoch time (minutes)
             eta_total_min = (spend_time / (step + 1)) * iters / 60.0
+            if current_lr_llm is not None:
+                lr_msg = (
+                    f'lr_speech_proj: {current_lr:.2e}, lr_llm_last: {current_lr_llm:.2e}'
+                )
+                wb_lr = {"lr_speech_proj": current_lr, "lr_llm_last": current_lr_llm}
+            else:
+                lr_msg = f'lr: {current_lr:.8f}'
+                wb_lr = {"learning_rate": current_lr}
             Logger(
                 f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
                 f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, '
-                f'aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_total_time: {eta_total_min:.1f}min'
+                f'aux_loss: {current_aux_loss:.4f}, {lr_msg}, epoch_total_time: {eta_total_min:.1f}min'
             )
             if wandb:
                 wandb.log({
                     "loss": current_loss,
                     "logits_loss": current_logits_loss,
                     "aux_loss": current_aux_loss,
-                    "learning_rate": current_lr,
+                    **wb_lr,
                     "epoch_total_time": eta_total_min,
                 })
 
@@ -112,7 +137,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.train()
             del state_dict, clean_state_dict
 
-        del input_ids, labels, pixel_values, speech_values, speech_lengths, res, loss
+        del input_ids, labels, speech_values, speech_lengths, res, loss
 
 
 if __name__ == "__main__":
@@ -122,10 +147,34 @@ if __name__ == "__main__":
     parser.add_argument('--weight', default='llm_768', type=str, help="initial weight prefix/path (default: out/llm_768.pth)")
     parser.add_argument("--epochs", type=int, default=4, help="epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="init learning rate")
+    parser.add_argument(
+        "--lr_speech_proj",
+        type=float,
+        default=1e-4,
+        help="speech_proj 学习率（随机初始化，通常较大）",
+    )
+    parser.add_argument(
+        "--lr_llm_last",
+        type=float,
+        default=1e-5,
+        help="最后一层 Transformer 学习率（预训练权重，通常较小）",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="未冻结整模时使用的单一学习率（--freeze_llm 0 时生效）",
+    )
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="train device")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="mixed precision")
     parser.add_argument("--num_workers", type=int, default=4, help="num workers")
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=1,
+        help="DataLoader 每个 worker 预取的 batch 数（仅 num_workers>0 时生效）。"
+        "batch 较大时请保持为 1，否则预取队列会成倍占用内存并可能触发换页导致磁盘满、GPU 空转。",
+    )
     parser.add_argument("--accumulation_steps", type=int, default=1, help="grad accumulation")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="grad clip")
     parser.add_argument("--log_interval", type=int, default=50, help="log interval")
@@ -301,10 +350,19 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        run_name = f"MiniMind-O-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        if bool(args.freeze_llm):
+            run_name = (
+                f"MiniMind-O-Pretrain-E{args.epochs}-B{args.batch_size}"
+                f"-lr_sp{args.lr_speech_proj}-lr_last{args.lr_llm_last}"
+            )
+        else:
+            run_name = (
+                f"MiniMind-O-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}"
+                f"-LearningRate-{args.learning_rate}"
+            )
         wandb.init(project=args.wandb_project, name=run_name, id=wandb_id, resume=resume)
 
-    model, tokenizer, preprocess = init_olm_model(
+    model, tokenizer, _ = init_olm_model(
         olm_config,
         from_weight=args.weight,
         device=args.device,
@@ -318,13 +376,46 @@ if __name__ == "__main__":
     train_ds = PretrainDataset(
         args.data_path,
         tokenizer,
-        preprocess=preprocess,
         speech_special_token=olm_config.speech_special_token,
         max_length=olm_config.max_seq_len,
     )
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
+    wd = 0.01
+    if bool(args.freeze_llm):
+        last_idx = olm_config.num_hidden_layers - 1
+        speech_proj_params = [p for p in model.speech_proj.parameters() if p.requires_grad]
+        last_layer_params = [
+            p for n, p in model.model.named_parameters()
+            if f"layers.{last_idx}." in n and p.requires_grad
+        ]
+        if not speech_proj_params or not last_layer_params:
+            raise RuntimeError(
+                f"分组优化器需要可训练的 speech_proj 与最后一层；"
+                f"got speech_proj={len(speech_proj_params)}, last_layer={len(last_layer_params)}"
+            )
+        optimizer = optim.AdamW(
+            [
+                {"params": speech_proj_params, "lr": args.lr_speech_proj},
+                {"params": last_layer_params, "lr": args.lr_llm_last},
+            ],
+            weight_decay=wd,
+        )
+        args._optimizer_grouped = True
+        if is_main_process():
+            Logger(
+                f"Optimizer param groups: speech_proj lr={args.lr_speech_proj}, "
+                f"layers.{last_idx} lr={args.lr_llm_last}, weight_decay={wd}"
+            )
+    else:
+        optimizer = optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.learning_rate,
+            weight_decay=wd,
+        )
+        args._optimizer_grouped = False
+        if is_main_process():
+            Logger(f"Optimizer (single group): lr={args.learning_rate}, weight_decay={wd}")
 
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -344,7 +435,16 @@ if __name__ == "__main__":
         indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        dl_kwargs = dict(
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=pretrain_collate_fn,
+        )
+        if args.num_workers > 0:
+            dl_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+            dl_kwargs["persistent_workers"] = True
+        loader = DataLoader(train_ds, **dl_kwargs)
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: skip first {start_step} steps, start from {start_step + 1}')
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)

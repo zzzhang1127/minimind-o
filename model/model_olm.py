@@ -70,17 +70,30 @@ class SpeechProj(nn.Module):
         # 1-layer audio projection: (compress time first, keep 512 dim) -> Linear(512 -> LM hidden)
         self.linear = nn.Linear(speech_hidden_size, hidden_size, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, lengths: Optional[torch.LongTensor] = None):
         # x: [B, T(=1500), 512]
         batch_size, seq_len, dim = x.size()
+        if lengths is not None:
+            lengths = lengths.to(x.device).clamp(min=0, max=seq_len)
+
         num_frames_to_discard = seq_len % self.k
         if num_frames_to_discard > 0:
             x = x[:, :-num_frames_to_discard, :]
             seq_len = x.size(1)
+            if lengths is not None:
+                lengths = lengths.clamp(max=seq_len)
 
         # compress to [B, T/k (=150), 512]
         x = x.contiguous().view(batch_size, seq_len // self.k, self.k, dim)  # [B,150,10,512]
-        x = x.mean(dim=2)  # no activation, keep pure compression
+        if lengths is None:
+            x = x.mean(dim=2)  # no activation, keep pure compression
+        else:
+            # Length-aware pooling: ignore padding frames while averaging each k-frame group.
+            frame_ids = torch.arange(seq_len, device=x.device).view(1, seq_len)  # [1, seq_len]
+            valid = frame_ids < lengths.view(-1, 1)  # [B, seq_len]
+            valid = valid.view(batch_size, seq_len // self.k, self.k, 1).to(x.dtype)  # [B,150,10,1]
+            counts = valid.sum(dim=2).clamp(min=1.0)  # [B,150,1]
+            x = (x * valid).sum(dim=2) / counts
         return self.linear(x)  # [B,150,LM_hidden]
 
 
@@ -336,7 +349,19 @@ class MiniMindOLM(MiniMindForCausalLM):
                 MiniMindOLM.get_speech_embeddings(speech_values[:, i, :, :], self.speech_encoder)
                 for i in range(num)
             ], dim=1)
-            speech_proj = self.speech_proj(speech_tensors.view(bs * num, speech_tensors.size(2), speech_tensors.size(3)))
+
+            encoder_lengths = None
+            if speech_lengths is not None:
+                # Whisper encoder downsamples length by 2: 3000 -> 1500.
+                encoder_lengths = (speech_lengths // 2).clamp(min=0, max=speech_tensors.size(2))
+                if encoder_lengths.dim() == 1:
+                    encoder_lengths = encoder_lengths.unsqueeze(1)
+                encoder_lengths = encoder_lengths.reshape(bs * num)
+
+            speech_proj = self.speech_proj(
+                speech_tensors.view(bs * num, speech_tensors.size(2), speech_tensors.size(3)),
+                lengths=encoder_lengths,
+            )
             speech_proj = speech_proj.view(bs, num, speech_proj.size(1), speech_proj.size(2))
             hidden_states = self._count_modal_proj(
                 tokens=input_ids,
