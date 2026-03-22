@@ -51,7 +51,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 cur_step, total_steps, args.lr_llm_last
             )
         else:
-            lr = get_lr(cur_step, total_steps, args.learning_rate)
+            # 仅 speech_proj 一组：用 lr_speech_proj 做余弦调度
+            lr = get_lr(cur_step, total_steps, args.lr_speech_proj)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
@@ -84,7 +85,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 current_lr = optimizer.param_groups[0]["lr"]
                 current_lr_llm = optimizer.param_groups[1]["lr"]
             else:
-                current_lr = optimizer.param_groups[-1]["lr"]
+                current_lr = optimizer.param_groups[0]["lr"]
                 current_lr_llm = None
             # Predicted total epoch time (minutes)
             eta_total_min = (spend_time / (step + 1)) * iters / 60.0
@@ -94,8 +95,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 )
                 wb_lr = {"lr_speech_proj": current_lr, "lr_llm_last": current_lr_llm}
             else:
-                lr_msg = f'lr: {current_lr:.8f}'
-                wb_lr = {"learning_rate": current_lr}
+                lr_msg = f'lr_speech_proj: {current_lr:.2e}'
+                wb_lr = {"lr_speech_proj": current_lr}
             Logger(
                 f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
                 f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, '
@@ -144,9 +145,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind-O Pretrain")
     parser.add_argument("--save_dir", type=str, default="../out", help="model save dir")
     parser.add_argument('--save_weight', default='pretrain_olm', type=str, help="save weight prefix")
-    parser.add_argument('--weight', default='llm_768', type=str, help="initial weight prefix/path (default: out/llm_768.pth)")
+    parser.add_argument(
+        '--weight',
+        default='pytorch_model',
+        type=str,
+        help="初始权重：在 save_dir 下查找 {prefix}.pth/.bin（默认 pytorch_model → out/pytorch_model.bin，"
+        "建议使用已含 vision_proj 的多模态基座，如从 minimind-v MiniMind2-V 复制到 out/）",
+    )
     parser.add_argument("--epochs", type=int, default=4, help="epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument(
         "--lr_speech_proj",
         type=float,
@@ -163,27 +170,38 @@ if __name__ == "__main__":
         "--learning_rate",
         type=float,
         default=1e-4,
-        help="未冻结整模时使用的单一学习率（--freeze_llm 0 时生效）",
+        help="保留项；当前预训练用分组 lr（--freeze_llm 0）或仅 lr_speech_proj（--freeze_llm 1），一般无需设置",
     )
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="train device")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="mixed precision")
-    parser.add_argument("--num_workers", type=int, default=4, help="num workers")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="数据加载进程数。Windows/大 parquet 场景下多 worker 易占满内存，默认 0（主进程加载最省内存）。",
+    )
     parser.add_argument(
         "--prefetch_factor",
         type=int,
-        default=1,
-        help="DataLoader 每个 worker 预取的 batch 数（仅 num_workers>0 时生效）。"
-        "batch 较大时请保持为 1，否则预取队列会成倍占用内存并可能触发换页导致磁盘满、GPU 空转。",
+        default=2,
+        help="仅 num_workers>0 时生效；每个 worker 预取的 batch 数（PyTorch 要求>=2）。",
     )
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="grad accumulation")
+    parser.add_argument("--accumulation_steps", type=int, default=2, help="grad accumulation")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="grad clip")
-    parser.add_argument("--log_interval", type=int, default=50, help="log interval")
-    parser.add_argument("--save_interval", type=int, default=500, help="save interval")
+    parser.add_argument("--log_interval", type=int, default=10, help="log interval")
+    parser.add_argument("--save_interval", type=int, default=100, help="save interval")
     parser.add_argument('--max_seq_len', default=768, type=int, help="max seq len")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_s2t.parquet", help="train data path")
     parser.add_argument('--mode', default='speech', type=str, choices=['speech'], help="training mode (pretrain supports speech only)")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="resume training")
-    parser.add_argument('--freeze_llm', default=1, type=int, choices=[0, 1], help="freeze llm")
+    parser.add_argument(
+        '--freeze_llm',
+        default=1,
+        type=int,
+        choices=[0, 1],
+        help="1=仅训练 speech_proj，LLM（含最后一层 Transformer）全部冻结；"
+        "0=训练 speech_proj + 解冻最后一层 Transformer，其余 LLM 冻结。可先 1 对齐投影再 0 训最后一层。",
+    )
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="use torch.compile")
     parser.add_argument("--use_wandb", action="store_true", help="use wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-O-Pretrain", help="wandb project")
@@ -350,21 +368,22 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        if bool(args.freeze_llm):
+        if not bool(args.freeze_llm):
             run_name = (
                 f"MiniMind-O-Pretrain-E{args.epochs}-B{args.batch_size}"
                 f"-lr_sp{args.lr_speech_proj}-lr_last{args.lr_llm_last}"
             )
         else:
             run_name = (
-                f"MiniMind-O-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}"
-                f"-LearningRate-{args.learning_rate}"
+                f"MiniMind-O-Pretrain-E{args.epochs}-B{args.batch_size}"
+                f"-projonly-lr_sp{args.lr_speech_proj}"
             )
         wandb.init(project=args.wandb_project, name=run_name, id=wandb_id, resume=resume)
 
     model, tokenizer, _ = init_olm_model(
         olm_config,
         from_weight=args.weight,
+        save_dir=args.save_dir,
         device=args.device,
         freeze_llm=bool(args.freeze_llm),
         mode=args.mode,
@@ -382,7 +401,7 @@ if __name__ == "__main__":
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     wd = 0.01
-    if bool(args.freeze_llm):
+    if not bool(args.freeze_llm):
         last_idx = olm_config.num_hidden_layers - 1
         speech_proj_params = [p for p in model.speech_proj.parameters() if p.requires_grad]
         last_layer_params = [
@@ -408,14 +427,19 @@ if __name__ == "__main__":
                 f"layers.{last_idx} lr={args.lr_llm_last}, weight_decay={wd}"
             )
     else:
+        speech_proj_params = [p for p in model.speech_proj.parameters() if p.requires_grad]
+        if not speech_proj_params:
+            raise RuntimeError("freeze_llm=1 需要可训练的 speech_proj 参数")
         optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=args.learning_rate,
+            speech_proj_params,
+            lr=args.lr_speech_proj,
             weight_decay=wd,
         )
         args._optimizer_grouped = False
         if is_main_process():
-            Logger(f"Optimizer (single group): lr={args.learning_rate}, weight_decay={wd}")
+            Logger(
+                f"Optimizer (speech_proj only): lr={args.lr_speech_proj}, weight_decay={wd}"
+            )
 
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -438,11 +462,11 @@ if __name__ == "__main__":
         dl_kwargs = dict(
             batch_sampler=batch_sampler,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=(args.num_workers > 0),
             collate_fn=pretrain_collate_fn,
         )
         if args.num_workers > 0:
-            dl_kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+            dl_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
             dl_kwargs["persistent_workers"] = True
         loader = DataLoader(train_ds, **dl_kwargs)
         if skip > 0:

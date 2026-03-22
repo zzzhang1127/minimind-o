@@ -192,7 +192,7 @@ cd trainer
 python train_pretrain_olm.py ^
   --save_dir ../out ^
   --save_weight pretrain_olm ^
-  --weight sft_vlm ^
+  --weight pytorch_model ^
   --data_path ../dataset/pretrain_olm_speech.parquet ^
   --mode speech ^
   --freeze_llm 1 ^
@@ -204,16 +204,17 @@ python train_pretrain_olm.py ^
 
 参数解释：
 
-1. from_weight sft_vlm
-- 从 minimind-v 权重迁移
+1. `--weight pytorch_model`（默认）
+- 从 `out/pytorch_model.bin` 加载基座（建议将 `minimind-v/MiniMind2-V/pytorch_model.bin` 复制到 `minimind-o/out/`），该基座已含 **vision_proj** 与视觉能力；语音预训练阶段只训练 **speech_proj**（`freeze_llm=1` 时），**vision_proj** 冻结。
 
-2. train_modality speech
-- 只加载语音编码器
-- 视觉编码器不加载
-- 视觉投影层不更新
+2. `--mode speech`
+- 只加载 Whisper 语音编码器，不加载 CLIP；**视觉权重仍从 checkpoint 中继承**（用于后续阶段），当前前向不喂图像。
 
-3. freeze_llm 1
-- 主干大部分冻结，只让投影和最后层适度适配，稳定性更高
+3. 若需从纯 LLM 起步（无 `vision_proj`），可改为 `--weight llm_768`。
+
+4. freeze_llm（仅 `train_pretrain_olm.py`）
+- `1`：只训练 `speech_proj`，LLM（含最后一层 Transformer）全部冻结
+- `0`：训练 `speech_proj` + 最后一层 Transformer，其余 LLM 冻结（可先 1 再 0 分阶段训）
 
 ### 4.2 阶段B：SFT 指令微调（默认 both）
 
@@ -245,7 +246,8 @@ python train_sft_olm.py ^
 如果要训练视觉/多模态，请改用 SFT 脚本，例如：
 
 ~~~powershell
-python train_sft_olm.py --mode vision --freeze_llm 0 ...
+python train_sft_olm.py --mode vision ...
+（SFT 脚本内部使用 `full_finetune=True`，整模微调，仅冻结未使用模态的投影层）
 ~~~
 
 ---

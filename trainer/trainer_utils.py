@@ -76,13 +76,14 @@ def setup_seed(seed: int):
 
 def init_olm_model(
         olm_config,
-        from_weight='llm_768',
+        from_weight='pytorch_model',
         tokenizer_path='../model',
         vision_model_path='../model/vision_model/clip-vit-base-patch16',
         save_dir='../out',
         device='cuda',
         freeze_llm=False,
         mode='speech',
+        full_finetune: bool = False,
 ):
     mode = str(mode).lower()
     if mode not in {'speech', 'vision', 'both'}:
@@ -150,12 +151,44 @@ def init_olm_model(
         else:
             Logger(f'Weight not found, skip loading (from_weight={from_weight}).')
 
-    if freeze_llm:
-        for name, param in model.named_parameters():
-            if 'vision_proj' not in name and 'speech_proj' not in name:
+    # --- 可训练参数策略 ---
+    # full_finetune=True（如 SFT）：整模可训，仅冻结当前 mode 下不用的投影层。
+    # full_finetune=False（预训练对齐）：
+    #   freeze_llm=True  → 只训 speech_proj / vision_proj（LLM 含最后一层 Transformer 全部冻结）
+    #   freeze_llm=False → 训投影层 + 解冻最后一层 Transformer，其余 LLM 冻结
+    if full_finetune:
+        for param in model.parameters():
+            param.requires_grad = True
+        if mode == 'speech':
+            for param in model.vision_proj.parameters():
                 param.requires_grad = False
+        elif mode == 'vision':
+            for param in model.speech_proj.parameters():
+                param.requires_grad = False
+        get_model_params(model, olm_config)
+        Logger(f'Mode: {mode} (vision_encoder={load_vision_encoder}, speech_encoder={load_speech_encoder})')
+        Logger('Train scope: full_finetune (all trainable except inactive modality projector)')
+        Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
+        preprocess = model.processor
+        return model.to(device), tokenizer, preprocess
 
-    # Keep the inactive modality projector untouched during single-modality training.
+    for param in model.parameters():
+        param.requires_grad = False
+
+    if mode == 'speech':
+        for param in model.speech_proj.parameters():
+            param.requires_grad = True
+    elif mode == 'vision':
+        for param in model.vision_proj.parameters():
+            param.requires_grad = True
+    elif mode == 'both':
+        for param in model.speech_proj.parameters():
+            param.requires_grad = True
+        for param in model.vision_proj.parameters():
+            param.requires_grad = True
+    else:
+        raise ValueError(f'Invalid mode: {mode}')
+
     if mode == 'speech':
         for param in model.vision_proj.parameters():
             param.requires_grad = False
@@ -164,13 +197,17 @@ def init_olm_model(
             param.requires_grad = False
 
     last_layer_idx = olm_config.num_hidden_layers - 1
-    for name, param in model.model.named_parameters():
-        if f'layers.{last_layer_idx}.' in name:
-            param.requires_grad = True
+    if not freeze_llm:
+        for name, param in model.model.named_parameters():
+            if f'layers.{last_layer_idx}.' in name:
+                param.requires_grad = True
 
     get_model_params(model, olm_config)
     Logger(f'Mode: {mode} (vision_encoder={load_vision_encoder}, speech_encoder={load_speech_encoder})')
-    Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
+    if freeze_llm:
+        Logger('Train scope: projector only (all LLM layers frozen)')
+    else:
+        Logger(f'Train scope: projector + model.model.layers.{last_layer_idx} (rest of LLM frozen)')
     preprocess = model.processor
     return model.to(device), tokenizer, preprocess
 

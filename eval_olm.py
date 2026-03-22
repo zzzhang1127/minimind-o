@@ -28,6 +28,15 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 IMG_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+AUDIO_EXTS = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
+
+# 各 mode 在未指定 --prompt 时使用的默认用户提示（不含占位符，build_prompt 会按需追加 <image>/<speech>）
+DEFAULT_PROMPTS = {
+    "text": "你好，请用一句话介绍你自己。",
+    "vision": "图片里有什么？",
+    "speech": "请转录这段语音。",
+    "both": "请结合图片与语音内容，用中文简要回答。",
+}
 WEIGHT_EXTS_PRIORITY = [
     '.pth',
     '.bin',
@@ -351,6 +360,23 @@ def _pick_random_image(repo_dir: Path) -> str:
     return str(chosen)
 
 
+def _pick_random_speech(repo_dir: Path) -> str:
+    eval_speech_dir = repo_dir / "dataset" / "eval_speeches"
+    if not eval_speech_dir.exists():
+        raise FileNotFoundError(f"未找到评测语音目录: {eval_speech_dir}")
+
+    audio_files = [
+        p for p in eval_speech_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+    ]
+    if not audio_files:
+        raise FileNotFoundError(f"目录内未找到音频文件({', '.join(sorted(AUDIO_EXTS))}): {eval_speech_dir}")
+
+    chosen = random.choice(audio_files)
+    print(f"[Speech] 随机选择语音: {chosen.name}")
+    return str(chosen)
+
+
 def _validate_mode_inputs(args, repo_dir: Path):
     has_img = bool(args.image_path)
     has_audio = bool(args.audio_path)
@@ -373,17 +399,15 @@ def _validate_mode_inputs(args, repo_dir: Path):
     if args.mode == "speech":
         if has_img:
             raise ValueError("mode=speech 不允许传入 --image_path")
-        if not args.audio_path or not os.path.exists(args.audio_path):
-            raise FileNotFoundError("mode=speech 必须传入存在的 --audio_path")
+        if args.audio_path and not os.path.exists(args.audio_path):
+            raise FileNotFoundError(f"--audio_path 不存在: {args.audio_path}")
         return
 
     if args.mode == "both":
-        if has_img and not os.path.exists(args.image_path):
+        if args.image_path and not os.path.exists(args.image_path):
             raise FileNotFoundError(f"--image_path 不存在: {args.image_path}")
-        if args.image_path == "":
-            raise FileNotFoundError("mode=both 必须传入存在的 --image_path")
-        if not args.audio_path or not os.path.exists(args.audio_path):
-            raise FileNotFoundError("mode=both 必须传入存在的 --audio_path")
+        if args.audio_path and not os.path.exists(args.audio_path):
+            raise FileNotFoundError(f"--audio_path 不存在: {args.audio_path}")
         return
 
     raise ValueError(f"未知 mode: {args.mode}")
@@ -407,20 +431,47 @@ def main():
     )
 
     parser.add_argument('--max_new_tokens', default=512, type=int, help="max new tokens")
-    parser.add_argument('--temperature', default=0.65, type=float, help="temperature")
-    parser.add_argument('--top_p', default=0.85, type=float, help="top p")
-    parser.add_argument('--prompt', default='图片里有什么？', type=str, help="user prompt")
+    parser.add_argument('--temperature', default=0.1, type=float, help="temperature")
+    parser.add_argument('--top_p', default=0.65, type=float, help="top p")
+    parser.add_argument(
+        '--prompt',
+        default=None,
+        type=str,
+        help="用户提示；不传则按 mode 使用内置默认（vision: 看图问答；speech: 转录；both: 图文音综合）",
+    )
     parser.add_argument('--image_path', default='', type=str, help="optional image path")
     parser.add_argument('--audio_path', default='', type=str, help="optional audio path")
     parser.add_argument('--show_speed', default=1, type=int, help="show speed")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="device")
     args = parser.parse_args()
 
-    setup_seed(2026)
-    _validate_mode_inputs(args, repo_dir)
+    if args.prompt is None:
+        args.prompt = DEFAULT_PROMPTS[args.mode]
 
+    setup_seed(2026)
+
+    # 未指定路径时从评测目录随机抽取（与 vision 行为一致）
     if args.mode == "vision" and not args.image_path:
         args.image_path = _pick_random_image(repo_dir)
+    if args.mode == "speech":
+        if args.audio_path:
+            if not os.path.exists(args.audio_path):
+                raise FileNotFoundError(f"--audio_path 不存在: {args.audio_path}")
+        else:
+            args.audio_path = _pick_random_speech(repo_dir)
+    if args.mode == "both":
+        if args.image_path:
+            if not os.path.exists(args.image_path):
+                raise FileNotFoundError(f"--image_path 不存在: {args.image_path}")
+        else:
+            args.image_path = _pick_random_image(repo_dir)
+        if args.audio_path:
+            if not os.path.exists(args.audio_path):
+                raise FileNotFoundError(f"--audio_path 不存在: {args.audio_path}")
+        else:
+            args.audio_path = _pick_random_speech(repo_dir)
+
+    _validate_mode_inputs(args, repo_dir)
 
     model, tokenizer, preprocess = init_model(args)
 

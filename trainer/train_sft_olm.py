@@ -172,6 +172,7 @@ if __name__ == "__main__":
         device=args.device,
         freeze_llm=False,
         mode=args.mode,
+        full_finetune=True,
     )
     if args.use_compile == 1:
         model = torch.compile(model)

@@ -202,7 +202,7 @@ python train_pretrain_olm.py \
   --save_dir ../out \
   --save_weight pretrain_olm \
   --data_path ../dataset/pretrain_s2t.parquet \
-  --weight sft_vlm \
+  --weight pytorch_model \
   --mode speech \
   --freeze_llm 1 \
   --batch_size 4 \

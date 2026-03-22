@@ -61,12 +61,12 @@ python validate_data_flow.py --parquet ./pretrain_s2t.parquet
 ```bash
 cd trainer
 
-# 使用最小配置进行 1 epoch 测试
+# 使用最小配置进行 1 epoch 测试（默认从 ../out/pytorch_model.bin 加载多模态基座，需事先复制 MiniMind2-V 的 pytorch_model.bin 到 out/；纯 LLM 可用 --weight llm_768）
 python train_pretrain_olm.py \
   --save_dir ../out \
   --save_weight pretrain_olm_test \
   --data_path ../dataset/pretrain_s2t.parquet \
-  --weight llm_768 \
+  --weight pytorch_model \
   --mode speech \
   --freeze_llm 1 \
   --batch_size 4 \
