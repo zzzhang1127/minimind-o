@@ -28,6 +28,9 @@ def get_model_params(model, config, ignore_patterns=None):
         return not any(p in n for p in ignore_patterns)
 
     total = sum(p.numel() for n, p in model.named_parameters() if should_count(n)) / 1e6
+    trainable = sum(
+        p.numel() for n, p in model.named_parameters() if should_count(n) and p.requires_grad
+    ) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
     n_shared = getattr(config, 'n_shared_experts', 0)
@@ -39,6 +42,10 @@ def get_model_params(model, config, ignore_patterns=None):
         Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
     else:
         Logger(f'Model Params: {total:.2f}M')
+    Logger(
+        f'Trainable Params: {trainable:.3f}M '
+        f'(same counting scope as total; excludes frozen vision_encoder / speech_encoder)'
+    )
 
 
 def is_main_process():
@@ -168,7 +175,6 @@ def init_olm_model(
         get_model_params(model, olm_config)
         Logger(f'Mode: {mode} (vision_encoder={load_vision_encoder}, speech_encoder={load_speech_encoder})')
         Logger('Train scope: full_finetune (all trainable except inactive modality projector)')
-        Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
         preprocess = model.processor
         return model.to(device), tokenizer, preprocess
 

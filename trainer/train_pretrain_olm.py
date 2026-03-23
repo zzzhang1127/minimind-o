@@ -1,3 +1,11 @@
+"""
+语音预训练入口。
+
+推荐：在 minimind-o 下执行 ``cd trainer`` 后 ``python train_pretrain_olm.py ...``。
+脚本启动时会 ``os.chdir`` 到本文件所在目录（trainer/），使默认的 ``../out``、
+``../dataset/...``、``init_olm_model`` 内的 ``../model`` 等路径始终相对仓库根目录，
+不随当前 shell 的 cwd 变化而跑偏。
+"""
 import os
 import sys
 
@@ -142,8 +150,17 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
+    # 固定工作目录为 minimind-o/trainer，保证 ../out、../dataset 等相对路径一致
+    _trainer_dir = Path(__file__).resolve().parent
+    os.chdir(_trainer_dir)
+
     parser = argparse.ArgumentParser(description="MiniMind-O Pretrain")
-    parser.add_argument("--save_dir", type=str, default="../out", help="model save dir")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="../out",
+        help="权重保存目录。默认 ../out；若只写 out（无 ../）则固定为 minimind-o/out，避免误用 trainer/out",
+    )
     parser.add_argument('--save_weight', default='pretrain_olm', type=str, help="save weight prefix")
     parser.add_argument(
         '--weight',
@@ -152,8 +169,8 @@ if __name__ == "__main__":
         help="初始权重：在 save_dir 下查找 {prefix}.pth/.bin（默认 pytorch_model → out/pytorch_model.bin，"
         "建议使用已含 vision_proj 的多模态基座，如从 minimind-v MiniMind2-V 复制到 out/）",
     )
-    parser.add_argument("--epochs", type=int, default=4, help="epochs")
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--epochs", type=int, default=10, help="epochs")
+    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument(
         "--lr_speech_proj",
         type=float,
@@ -184,28 +201,59 @@ if __name__ == "__main__":
         "--prefetch_factor",
         type=int,
         default=2,
-        help="仅 num_workers>0 时生效；每个 worker 预取的 batch 数（PyTorch 要求>=2）。",
+        help="仅 num_workers>0 时生效；每 worker 预取 batch 数（>=2）。"
+        "总预取约=num_workers×prefetch_factor，勿调大以免占内存。",
     )
-    parser.add_argument("--accumulation_steps", type=int, default=2, help="grad accumulation")
+    parser.add_argument(
+        "--persistent_workers",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="仅 num_workers>0；1=epoch 间保留 worker（略快、多占内存），0=默认每 epoch 重建（省内存）。",
+    )
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="grad accumulation")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="grad clip")
     parser.add_argument("--log_interval", type=int, default=10, help="log interval")
     parser.add_argument("--save_interval", type=int, default=100, help="save interval")
     parser.add_argument('--max_seq_len', default=768, type=int, help="max seq len")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_s2t.parquet", help="train data path")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="../dataset/pretrain_s2t.parquet",
+        help="训练 parquet。默认 ../dataset/...；无 ../ 前缀时相对 minimind-o 根目录",
+    )
     parser.add_argument('--mode', default='speech', type=str, choices=['speech'], help="training mode (pretrain supports speech only)")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="resume training")
     parser.add_argument(
         '--freeze_llm',
-        default=1,
+        default=0,
         type=int,
         choices=[0, 1],
         help="1=仅训练 speech_proj，LLM（含最后一层 Transformer）全部冻结；"
-        "0=训练 speech_proj + 解冻最后一层 Transformer，其余 LLM 冻结。可先 1 对齐投影再 0 训最后一层。",
+        "0=训练 speech_proj + 解冻最后一层 Transformer，其余 LLM 冻结。",
     )
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="use torch.compile")
     parser.add_argument("--use_wandb", action="store_true", help="use wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-O-Pretrain", help="wandb project")
     args = parser.parse_args()
+
+    _repo_root = Path(__file__).resolve().parent.parent
+
+    def _resolve_repo_relative_path(p: str) -> str:
+        """
+        以 ``../`` 或 ``..`` 开头：相对当前工作目录（已 chdir 到 trainer/）。
+        否则：相对 minimind-o 根目录（这样 ``--save_dir out`` 指向仓库的 out/，而非 trainer/out）。
+        """
+        path = Path(p)
+        if path.is_absolute():
+            return str(path)
+        s = str(p).replace("\\", "/").strip()
+        if s.startswith(".."):
+            return str((Path.cwd() / path).resolve())
+        return str((_repo_root / path).resolve())
+
+    args.save_dir = _resolve_repo_relative_path(args.save_dir)
+    args.data_path = _resolve_repo_relative_path(args.data_path)
 
     local_rank = init_distributed_mode()
     if dist.is_initialized():
@@ -395,7 +443,6 @@ if __name__ == "__main__":
     train_ds = PretrainDataset(
         args.data_path,
         tokenizer,
-        speech_special_token=olm_config.speech_special_token,
         max_length=olm_config.max_seq_len,
     )
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
@@ -453,6 +500,17 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    if is_main_process():
+        if args.num_workers > 0:
+            _pf = max(2, int(args.prefetch_factor))
+            Logger(
+                f"DataLoader: num_workers={args.num_workers}, prefetch_factor={_pf}, "
+                f"persistent_workers={bool(args.persistent_workers)} "
+                f"(~{args.num_workers * _pf} batches may be prefetched)"
+            )
+        else:
+            Logger("DataLoader: num_workers=0 (no worker prefetch, lowest host RAM)")
+
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
@@ -466,8 +524,9 @@ if __name__ == "__main__":
             collate_fn=pretrain_collate_fn,
         )
         if args.num_workers > 0:
-            dl_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
-            dl_kwargs["persistent_workers"] = True
+            _pf = max(2, int(args.prefetch_factor))
+            dl_kwargs["prefetch_factor"] = _pf
+            dl_kwargs["persistent_workers"] = bool(args.persistent_workers)
         loader = DataLoader(train_ds, **dl_kwargs)
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: skip first {start_step} steps, start from {start_step + 1}')

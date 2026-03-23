@@ -1,5 +1,9 @@
+"""
+SFT 训练入口。启动时会 os.chdir 到本文件所在目录（trainer/），默认 ../out、../dataset 相对仓库根。
+"""
 import os
 import sys
+from pathlib import Path
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -114,15 +118,41 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 
 if __name__ == "__main__":
+    _trainer_dir = Path(__file__).resolve().parent
+    os.chdir(_trainer_dir)
+
     parser = argparse.ArgumentParser(description="MiniMind-O SFT")
-    parser.add_argument("--save_dir", type=str, default="../out", help="model save dir")
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="../out",
+        help="权重保存目录；只写 out 时固定为 minimind-o/out",
+    )
     parser.add_argument('--save_weight', default='sft_olm', type=str, help="save weight prefix")
     parser.add_argument("--epochs", type=int, default=2, help="epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-6, help="init learning rate")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="train device")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="mixed precision")
-    parser.add_argument("--num_workers", type=int, default=4, help="num workers")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="数据加载进程数；默认 0 省内存，可改为 2–4 提速（更占内存）。",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="仅 num_workers>0；每 worker 预取 batch 数（>=2），总预取≈num_workers×prefetch_factor。",
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="仅 num_workers>0；0=省内存（默认），1=epoch 间保留 worker。",
+    )
     parser.add_argument("--accumulation_steps", type=int, default=1, help="grad accumulation")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="grad clip")
     parser.add_argument("--log_interval", type=int, default=50, help="log interval")
@@ -131,7 +161,12 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="num hidden layers")
     parser.add_argument('--max_seq_len', default=1536, type=int, help="max seq len")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="use moe")
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_olm.parquet", help="train data path")
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="../dataset/sft_olm.parquet",
+        help="训练 parquet（默认 ../dataset/sft_olm.parquet，相对 trainer/）",
+    )
     parser.add_argument('--from_weight', default='pretrain_olm', type=str, help="load from which weight")
     parser.add_argument('--mode', default='both', type=str, choices=['speech', 'vision', 'both'], help="training mode")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="resume training")
@@ -139,6 +174,20 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="use wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-O-SFT", help="wandb project")
     args = parser.parse_args()
+
+    _repo_root = Path(__file__).resolve().parent.parent
+
+    def _resolve_repo_relative_path(p: str) -> str:
+        path = Path(p)
+        if path.is_absolute():
+            return str(path)
+        s = str(p).replace("\\", "/").strip()
+        if s.startswith(".."):
+            return str((Path.cwd() / path).resolve())
+        return str((_repo_root / path).resolve())
+
+    args.save_dir = _resolve_repo_relative_path(args.save_dir)
+    args.data_path = _resolve_repo_relative_path(args.data_path)
 
     local_rank = init_distributed_mode()
     if dist.is_initialized():
@@ -183,7 +232,6 @@ if __name__ == "__main__":
         tokenizer,
         preprocess=preprocess,
         image_special_token=olm_config.image_special_token,
-        speech_special_token=olm_config.speech_special_token,
         max_length=olm_config.max_seq_len,
     )
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
@@ -202,13 +250,32 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    if is_main_process():
+        if args.num_workers > 0:
+            _pf = max(2, int(args.prefetch_factor))
+            Logger(
+                f"DataLoader: num_workers={args.num_workers}, prefetch_factor={_pf}, "
+                f"persistent_workers={bool(args.persistent_workers)} "
+                f"(~{args.num_workers * _pf} batches may be prefetched)"
+            )
+        else:
+            Logger("DataLoader: num_workers=0 (no worker prefetch, lowest host RAM)")
+
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
         indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        dl_kwargs = dict(
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=(args.num_workers > 0 and "cuda" in args.device),
+        )
+        if args.num_workers > 0:
+            dl_kwargs["prefetch_factor"] = max(2, int(args.prefetch_factor))
+            dl_kwargs["persistent_workers"] = bool(args.persistent_workers)
+        loader = DataLoader(train_ds, **dl_kwargs)
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: skip first {start_step} steps, start from {start_step + 1}')
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)

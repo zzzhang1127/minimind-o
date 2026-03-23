@@ -2,17 +2,16 @@
 
 ## 🔴 关键问题汇总
 
-### Problem #1: 占位符 Tokenization 不确定 ⚠️ **CRITICAL**
+### Problem #1: 语音占位符数量须与 `N = P // 10` 一致 ⚠️ **CRITICAL**
 
-**现象:**
-- `OLMConfig.speech_ids = [35] * 100` 假设每个 `#` token ID 都是 35
-- 但 tokenizer 处理 `'####...(100个#)'` 时可能不会生成 100 个ID
-- 导致 `_count_modal_proj` 找不到需要替换的占位符
+**当前设计（minimind-o）:**
+- **P**：有效 Whisper **encoder** 时间帧数（代码里 `encoder_len = mel_len // 2`）。
+- **N**：语音侧 token 数，`N = P // speech_frames_per_token`（默认每 10 帧 encoder → 1 个 LLM token）。`P < 10` 时 **N=0**（该样本在预训练里会被跳过）。
+- 数据侧用连续 **`#`**（tokenizer 中应对应同一 `speech_token_id`，默认 **5**）重复 **N** 次替换 `<speech>`。
+- 模型侧用 **`_find_consecutive_token_spans`** 定位连续 `speech_token_id`，再用 **`SpeechProj`** 输出的 `[N, hidden]` 逐段替换，**不再**使用固定长度的 `speech_ids` 模板匹配。
 
 **影响:**
-- 音频特征无法正确注入
-- 模型收不到音频信息
-- 训练失败或特征混乱
+- 若 `#` 的个数 ≠ `N`，前向会 `ValueError: speech token 数与占位符不一致`。
 
 **快速检查:**
 ```bash
@@ -20,21 +19,15 @@ cd dataset
 python verify_tokenization.py
 ```
 
-**预期输出:**
-```
-✅ 占位符 tokenization 正确！
-   Token 数量: 100
-   Token IDs: [35, 35, 35, ..., 35]
-   是否全为 35: True
-   是否恰好 100 个: True
+**还须检查** 与 parquet 样本一致：
+```bash
+python validate_data_flow.py --parquet ./pretrain_s2t.parquet
 ```
 
-如果 ❌ 失败，则需要**修改 OLMConfig**：
+### 大数据集 Parquet（约 10GB+）与内存
 
-修复步骤:
-1. 运行验证脚本获得实际的 token 数量和 IDs
-2. 更新 `OLMConfig.speech_ids = [real_id] * real_count`
-3. 确保 `speech_special_token` 长度也要调整
+- **`PretrainDataset`** 已改为**不**一次性 `read_table` 载入全表：启动时只扫描元数据（行组边界）并用 **schema 列名** 校验，**不会**为校验而 `read_row_group` 解压首个行组；`__getitem__` 时对该样本所在 **row group** 调用 `read_row_group`（仅两列），用毕 `del` 释放 `Table`。
+- 若单个 row group 仍极大（例如整库只有一个超大 group），一次读取仍会占很多内存；请在生成 Parquet 时控制 **row group 大小**或拆成多个 **shard** 文件，并将训练参数 `parquet_path` 设为**目录**（该目录下所有 `*.parquet`）或 **通配路径**（如 `data/part_*.parquet`）。
 
 ### Problem #2: Speech Lengths 未被使用
 
@@ -144,19 +137,8 @@ python dataset/verify_tokenization.py
 ```
 
 **如果失败:**
-- 记下实际的 token 数量和 IDs
-- 修改 `model/model_olm.py` 中的 OLMConfig
-
-```python
-# 修前
-class OLMConfig(MiniMindConfig):
-    speech_ids: List = [35] * 100
-    
-# 修后 (假设实际是 [32] * 50)
-class OLMConfig(MiniMindConfig):
-    speech_ids: List = [32] * 50  # ← 根据验证结果更新
-    speech_special_token: str = '#' * 50  # ← 也要匹配
-```
+- 确认 tokenizer 下单个 `#` 的 `input_id` 与 `OLMConfig.speech_token_id`（默认 5）一致
+- 确认样本里「`#` 的个数」等于 `N = (mel_len//2) // 10`（见 `num_speech_tokens_from_encoder_length`）
 
 ### Step 2: 验证数据流
 ```bash
@@ -164,11 +146,11 @@ python dataset/validate_data_flow.py --parquet dataset/pretrain_s2t.parquet
 ```
 
 **检查清单:**
-- ✅ `Sample [0]: speech_tensor shape: (1, T, 128)` - 维度正确
-- ✅ `Speech placeholder tokens in input_ids: 100` - 占位符被正确替换
-- ✅ `Speech tensor contains NaN: False` - 没有无效值
-- ✅ `Batch collation valid` - Batch 处理正常
-- ✅ `Forward pass successful` - 模型能处理数据
+- ✅ `speech_tensor shape: (1, T, 80)` — mel 维 80
+- ✅ `expected speech tokens N` 与 `input_ids` 里 `#`（`speech_token_id`）计数一致
+- ✅ `Speech tensor contains NaN: False`
+- ✅ `Batch collation valid`（`pretrain_collate_fn`）
+- ✅ `Forward pass successful`
 
 ### Step 3: 处理可变长度音频 (可选)
 
@@ -219,16 +201,15 @@ python train_pretrain_olm.py \
 
 **诊断步骤:**
 
-1. 检查 `_count_modal_proj` 是否找到占位符:
+1. 检查 `_find_consecutive_token_spans(tokens, speech_token_id)` 是否找到连续 `#`：
 
 ```python
-# 在 model_olm.py 中添加 debug 代码
-def _count_modal_proj(self, tokens, h, modal_tensors, modal_ids, seqlen=512):
-    indices = self._find_indices(tokens, modal_ids)
-    print(f"[DEBUG] Looking for modal_ids={modal_ids}")
-    print(f"[DEBUG] Found indices: {indices}")
+# 在 model_olm.py 中调试语音注入
+def _inject_speech_tokens(...):
+    spans = self._find_consecutive_token_spans(tokens, token_id)
+    print(f"[DEBUG] speech spans: {spans}")
     
-    if modal_tensors is None or not indices:
+    if not speech_proj_grouped or not spans:
         print(f"[DEBUG] Returning h unchanged (no match found)")
         return h
     # ... rest of code

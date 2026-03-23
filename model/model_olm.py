@@ -26,6 +26,17 @@ def _get_whisper_feature_extractor():
     return _WHISPER_FEATURE_EXTRACTOR
 
 
+def num_speech_tokens_from_encoder_length(encoder_len: int, frames_per_token: int = 10) -> int:
+    """
+    有效 Whisper encoder 帧数 P（满 30s 约 1500）。
+    语音 token 数 N = P // frames_per_token（纯向下取整）；P < frames_per_token 时 N=0。
+    等价于 floor((s/30) * (1500/10))（s 为有效时长对应秒数时与 mel 对齐）。
+    """
+    if encoder_len <= 0:
+        return 0
+    return encoder_len // frames_per_token
+
+
 class OLMConfig(MiniMindConfig):
     model_type = "minimind-o"
 
@@ -33,21 +44,28 @@ class OLMConfig(MiniMindConfig):
             self,
             image_special_token: str = '@' * 196,
             image_ids: List = [34] * 196,
-            speech_special_token: str = '#' * 150,
-            speech_ids: List = [5] * 150,
+            # 占位符在数据侧按音频长度动态生成「#」*N；模型侧用连续 speech_token_id 定位整段。
+            speech_special_token: str = "",
+            speech_ids: List = [5] * 10,  # 遗留字段；语音注入已改为连续 speech_token_id 可变长匹配
+            speech_token_id: int = 5,
+            # 满 30s → 1500 帧 encoder；每 10 帧池化为 1 个语音 token → 最多 150 个。
+            speech_frames_per_token: int = 10,
             # Use local whisper-base by default (see get_speech_model).
             speech_encoder: str = 'whisper-base',
-            # whisper encoder output length is 1500; compress to 150 by ds_rate=10.
-            speech_encoder_ds_rate: int = 10,
             speech_encoder_hidden_size: int = 512,
             **kwargs,
     ):
+        # 旧版配置字段兼容
+        kwargs.pop("speech_encoder_keep_frames", None)
+        kwargs.pop("speech_encoder_ds_rate", None)
+        kwargs.pop("speech_encoder_output_tokens", None)
         self.image_special_token = image_special_token
         self.image_ids = image_ids
         self.speech_special_token = speech_special_token
         self.speech_ids = speech_ids
+        self.speech_token_id = speech_token_id
+        self.speech_frames_per_token = speech_frames_per_token
         self.speech_encoder = speech_encoder
-        self.speech_encoder_ds_rate = speech_encoder_ds_rate
         self.speech_encoder_hidden_size = speech_encoder_hidden_size
         super().__init__(**kwargs)
 
@@ -64,37 +82,38 @@ class VisionProj(nn.Module):
 
 
 class SpeechProj(nn.Module):
-    def __init__(self, speech_hidden_size=512, hidden_size=512, ds_rate=10):
+    def __init__(self, speech_hidden_size=512, hidden_size=512, frames_per_token: int = 10):
         super().__init__()
-        self.k = ds_rate
-        # 1-layer audio projection: (compress time first, keep 512 dim) -> Linear(512 -> LM hidden)
+        self.frames_per_token = frames_per_token
         self.linear = nn.Linear(speech_hidden_size, hidden_size, bias=True)
 
     def forward(self, x, lengths: Optional[torch.LongTensor] = None):
-        # x: [B, T(=1500), 512]
-        batch_size, seq_len, dim = x.size()
-        if lengths is not None:
-            lengths = lengths.to(x.device).clamp(min=0, max=seq_len)
+        """
+        x: [B, T(=1500), 512] Whisper encoder 输出。
+        lengths: 有效 encoder 帧数 P（mel 时间维 // 2）。N = P // K（K=frames_per_token），余帧丢弃。
+        返回 List[Tensor]，长度 B，每项 [N_i, D]（N_i 可为 0 当 P < K）。
+        """
+        B, T, D = x.shape
+        fpt = self.frames_per_token
+        outs: List[torch.Tensor] = []
 
-        num_frames_to_discard = seq_len % self.k
-        if num_frames_to_discard > 0:
-            x = x[:, :-num_frames_to_discard, :]
-            seq_len = x.size(1)
-            if lengths is not None:
-                lengths = lengths.clamp(max=seq_len)
-
-        # compress to [B, T/k (=150), 512]
-        x = x.contiguous().view(batch_size, seq_len // self.k, self.k, dim)  # [B,150,10,512]
         if lengths is None:
-            x = x.mean(dim=2)  # no activation, keep pure compression
+            lens = torch.full((B,), T, device=x.device, dtype=torch.long)
         else:
-            # Length-aware pooling: ignore padding frames while averaging each k-frame group.
-            frame_ids = torch.arange(seq_len, device=x.device).view(1, seq_len)  # [1, seq_len]
-            valid = frame_ids < lengths.view(-1, 1)  # [B, seq_len]
-            valid = valid.view(batch_size, seq_len // self.k, self.k, 1).to(x.dtype)  # [B,150,10,1]
-            counts = valid.sum(dim=2).clamp(min=1.0)  # [B,150,1]
-            x = (x * valid).sum(dim=2) / counts
-        return self.linear(x)  # [B,150,LM_hidden]
+            lens = lengths.to(x.device).clamp(min=0, max=T)
+
+        for i in range(B):
+            p = int(lens[i].item())
+            n = num_speech_tokens_from_encoder_length(p, fpt)
+            if n == 0:
+                outs.append(x.new_zeros(0, self.linear.out_features))
+                continue
+            seg = x[i, :p, :]
+            used = n * fpt
+            seg = seg[:used]
+            chunks = seg.view(n, fpt, D).mean(dim=1)
+            outs.append(self.linear(chunks))
+        return outs
 
 
 class MiniMindOLM(MiniMindForCausalLM):
@@ -120,7 +139,7 @@ class MiniMindOLM(MiniMindForCausalLM):
         self.speech_proj = SpeechProj(
             speech_hidden_size=params.speech_encoder_hidden_size,
             hidden_size=params.hidden_size,
-            ds_rate=params.speech_encoder_ds_rate,
+            frames_per_token=params.speech_frames_per_token,
         )
 
     @staticmethod
@@ -252,6 +271,66 @@ class MiniMindOLM(MiniMindForCausalLM):
             for batch_idx in range(tokens.size(0)) if matches[batch_idx].any()
         } or None
 
+    @staticmethod
+    def _find_consecutive_token_spans(tokens: torch.Tensor, token_id: int):
+        """连续相同 token_id 的区间 [start, end]（含端点），用于可变长语音占位。"""
+        B, L = tokens.shape
+        out = {}
+        for b in range(B):
+            row = tokens[b]
+            spans = []
+            i = 0
+            while i < L:
+                if row[i].item() == token_id:
+                    j = i + 1
+                    while j < L and row[j].item() == token_id:
+                        j += 1
+                    spans.append((i, j - 1))
+                    i = j
+                else:
+                    i += 1
+            if spans:
+                out[b] = spans
+        return out if out else None
+
+    def _inject_speech_tokens(
+        self,
+        h: torch.Tensor,
+        tokens: torch.Tensor,
+        speech_proj_grouped: List[List[torch.Tensor]],
+        seqlen: int,
+        token_id: int,
+    ):
+        spans = self._find_consecutive_token_spans(tokens, token_id)
+        if not speech_proj_grouped or not spans:
+            return h
+        new_h = []
+        for i in range(h.size(0)):
+            if i not in spans:
+                new_h.append(h[i])
+                continue
+            h_i = h[i]
+            modal_idx = 0
+            row = speech_proj_grouped[i]
+            for start_idx, end_idx in spans[i]:
+                if modal_idx >= len(row):
+                    break
+                modal_hidden = row[modal_idx]
+                span_len = end_idx - start_idx + 1
+                if modal_hidden.size(0) != span_len:
+                    raise ValueError(
+                        f"speech token 数与占位符不一致: modal_hidden.size(0)={modal_hidden.size(0)} "
+                        f"vs span_len={span_len}。请检查数据侧 '#' 数量与 encoder 长度公式。"
+                    )
+                h_i = torch.cat((h_i[:start_idx], modal_hidden, h_i[end_idx + 1:]), dim=0)[:seqlen]
+                modal_idx += 1
+            new_h.append(h_i)
+        return torch.stack(new_h, dim=0)
+
+    @staticmethod
+    def num_speech_tokens_from_encoder_length(encoder_len: int, frames_per_token: int = 10) -> int:
+        return num_speech_tokens_from_encoder_length(encoder_len, frames_per_token)
+
     def _count_modal_proj(self, tokens, h, modal_tensors, modal_ids, seqlen=512):
         indices = self._find_indices(tokens, modal_ids)
         if modal_tensors is None or not indices:
@@ -358,17 +437,19 @@ class MiniMindOLM(MiniMindForCausalLM):
                     encoder_lengths = encoder_lengths.unsqueeze(1)
                 encoder_lengths = encoder_lengths.reshape(bs * num)
 
-            speech_proj = self.speech_proj(
+            speech_proj_list = self.speech_proj(
                 speech_tensors.view(bs * num, speech_tensors.size(2), speech_tensors.size(3)),
                 lengths=encoder_lengths,
             )
-            speech_proj = speech_proj.view(bs, num, speech_proj.size(1), speech_proj.size(2))
-            hidden_states = self._count_modal_proj(
-                tokens=input_ids,
-                h=hidden_states,
-                modal_tensors=speech_proj,
-                modal_ids=self.params.speech_ids,
+            grouped: List[List[torch.Tensor]] = []
+            for b in range(bs):
+                grouped.append([speech_proj_list[b * num + j] for j in range(num)])
+            hidden_states = self._inject_speech_tokens(
+                hidden_states,
+                input_ids,
+                grouped,
                 seqlen=input_ids.shape[1],
+                token_id=self.params.speech_token_id,
             )
 
         position_embeddings = (

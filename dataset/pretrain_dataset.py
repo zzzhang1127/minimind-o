@@ -1,9 +1,11 @@
+import bisect
+import glob as glob_mod
 import io
 import os
 import wave
 import random
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -16,7 +18,34 @@ __package__ = "dataset"
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from model.model_olm import num_speech_tokens_from_encoder_length
+
 _WHISPER_BASE_DIR: Optional[str] = None
+
+
+def resolve_parquet_paths(parquet_path: Union[str, Path]) -> List[Path]:
+    """
+    支持：
+      - 单个 .parquet 文件
+      - 目录：递归或非递归收集 *.parquet（此处为单层目录下所有 *.parquet）
+      - 含通配符的路径（如 data/part_*.parquet）
+
+    训练大数据集时建议拆成多个 shard 文件，避免单文件过大。
+    """
+    p = Path(parquet_path)
+    if p.is_dir():
+        return sorted(p.glob("*.parquet"))
+    s = str(parquet_path)
+    if any(ch in s for ch in "*?["):
+        files = sorted(glob_mod.glob(s))
+        if not files:
+            raise FileNotFoundError(f"通配路径未匹配到任何文件: {parquet_path}")
+        return [Path(x) for x in files]
+    if p.is_file():
+        return [p]
+    raise FileNotFoundError(f"不是有效的 parquet 文件或目录: {parquet_path}")
+
+
 _WHISPER_FEATURE_EXTRACTOR = None
 PROMPTS_ZH = [
     "<speech>\n请转录这段语音。",
@@ -51,21 +80,26 @@ class PretrainDataset(Dataset):
       - transcript_bytes: utf-8 bytes (pa.binary)
 
     Each __getitem__ constructs a 2-turn chat prompt:
-      user:  <speech> + "Please transcribe the speech."
+      user:  将 `<speech>` 替换为「#」重复 N 次（N = (mel_len//2) // 10，即 encoder 有效帧 P 每 10 帧对应 1 个 LLM token；P<10 则 N=0，样本丢弃）
       assistant: transcript text
 
     Then it returns:
       (input_ids, labels, speech_values, speech_lengths)
     仅语音：无图像、无 CLIP/像素输入，仅 mel 特征与文本 token。
     若传入 preprocess / image_special_token（兼容旧脚本），会被忽略。
+
+    **内存**：不一次性 `read_table` 全表。仅扫描元数据建立「全局行号 → (文件, row_group, 行内偏移)」；
+    `__getitem__` 时只 `read_row_group` 加载包含该行的那一个行组（仅两列）。
+    若单个 row group 仍极大（例如整库一个 group），请在生成 Parquet 时调小 row group 或拆成多个 shard 文件，
+    并将 `parquet_path` 设为目录或 `part_*.parquet` 通配。
     """
 
     def __init__(
         self,
-        parquet_path: str,
+        parquet_path: Union[str, Path],
         tokenizer,
         max_length: int = 768,
-        speech_special_token: str = "#" * 150,
+        speech_special_token: Optional[str] = None,
         prompt_text: str = "",
         fallback_speech_T: int = 3000,
         enable_spec_augment: bool = True,
@@ -75,49 +109,75 @@ class PretrainDataset(Dataset):
         image_special_token=None,
     ):
         super().__init__()
-        self.parquet_path = parquet_path
-        # NOTE: pyarrow.Table is generally not picklable on Windows spawn,
-        # so we keep it as a runtime cache and reload it inside workers when needed.
-        self.table = pq.read_table(parquet_path, memory_map=True)
+        self.parquet_path = str(parquet_path)
+        self._paths = resolve_parquet_paths(parquet_path)
+        if not self._paths:
+            raise FileNotFoundError(
+                f"未找到任何 .parquet 文件（目录为空或通配无匹配）: {parquet_path}"
+            )
+        self._pf_cache: Dict[str, pq.ParquetFile] = {}
+        # _cum_start[k] 为第 k 个 row_group 对应的全局起始行号；最后一项为总行数
+        self._cum_start: List[int] = [0]
+        # (parquet 路径, row_group_index, 该组行数)
+        self._seg_meta: List[Tuple[str, int, int]] = []
+
+        for path in self._paths:
+            pf = pq.ParquetFile(path, memory_map=True)
+            for rg in range(pf.num_row_groups):
+                n = pf.metadata.row_group(rg).num_rows
+                if n <= 0:
+                    continue
+                self._seg_meta.append((str(path), rg, n))
+                self._cum_start.append(self._cum_start[-1] + n)
+
+        if not self._seg_meta:
+            raise ValueError(
+                f"Parquet 中无有效行（或 row group 均为空）: {parquet_path}"
+            )
+
+        # 仅校验 schema 列名（读 Parquet 文件头/metadata），禁止 read_row_group 解压首个行组，避免大行组 OOM
+        p0, _, _ = self._seg_meta[0]
+        _pf0 = pq.ParquetFile(p0, memory_map=True)
+        cols = set(_pf0.schema_arrow.names)
+        if "speech_bytes" not in cols or "transcript_bytes" not in cols:
+            raise ValueError(
+                f"Invalid pretrain parquet schema. Need columns: speech_bytes, transcript_bytes. "
+                f"Got: {sorted(cols)}"
+            )
+
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.speech_token = speech_special_token
+        _ = speech_special_token
         self.prompt_text = prompt_text
-        # WhisperFeatureExtractor 默认 mel bins 固定为 80，这里保持一致。
         self.n_mels = 80
         self.fallback_speech_T = fallback_speech_T
         self.enable_spec_augment = enable_spec_augment
         self.enable_wave_augment = enable_wave_augment
         self.extractor = _get_whisper_feature_extractor()
 
-        self.columns = set(self.table.column_names)
-        if "speech_bytes" not in self.columns or "transcript_bytes" not in self.columns:
-            raise ValueError(
-                f"Invalid pretrain parquet schema. Need columns: speech_bytes, transcript_bytes. "
-                f"Got: {sorted(self.columns)}"
-            )
-
-        # For label generation: locate assistant message span via BOS/EOS token subsequences.
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False).input_ids
 
+    def _get_parquet_file(self, path_str: str) -> pq.ParquetFile:
+        if path_str not in self._pf_cache:
+            self._pf_cache[path_str] = pq.ParquetFile(path_str, memory_map=True)
+        return self._pf_cache[path_str]
+
     def __len__(self):
-        return len(self.table)
+        return self._cum_start[-1]
 
     def __getstate__(self):
-        """
-        Ensure the dataset object can be pickled for DataLoader workers on Windows.
-        pyarrow.Table is not safely picklable, so drop it from the state and reload in __getitem__.
-        """
         state = self.__dict__.copy()
-        state["table"] = None
+        state["_pf_cache"] = {}
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        self._pf_cache = getattr(self, "_pf_cache", {})
 
-    def create_chat_prompt(self, transcript: str) -> str:
+    def create_chat_prompt(self, transcript: str, n_speech_tokens: int) -> str:
         base_prompt = self.prompt_text if self.prompt_text else random.choice(PROMPTS_ZH)
+        speech_placeholder = "#" * n_speech_tokens
         conversations = [
             {"content": base_prompt},
             {"content": transcript},
@@ -125,7 +185,7 @@ class PretrainDataset(Dataset):
         messages = []
         for i, turn in enumerate(conversations):
             role = "user" if i % 2 == 0 else "assistant"
-            content = turn["content"].replace("<speech>", self.speech_token)
+            content = turn["content"].replace("<speech>", speech_placeholder)
             messages.append({"role": role, "content": content})
 
         return self.tokenizer.apply_chat_template(
@@ -233,11 +293,16 @@ class PretrainDataset(Dataset):
             return None
 
     def __getitem__(self, index: int):
-        if self.table is None:
-            # Worker-safe lazy init
-            self.table = pq.read_table(self.parquet_path, memory_map=True)
-        speech_bytes = self.table["speech_bytes"][index].as_py()
-        transcript_bytes = self.table["transcript_bytes"][index].as_py()
+        j = bisect.bisect_right(self._cum_start, index) - 1
+        path_str, rg, nrows = self._seg_meta[j]
+        local_i = index - self._cum_start[j]
+        if not (0 <= local_i < nrows):
+            raise IndexError(f"index {index} out of range for segment {j} (local {local_i}, nrows {nrows})")
+        pf = self._get_parquet_file(path_str)
+        tbl = pf.read_row_group(rg, columns=["speech_bytes", "transcript_bytes"])
+        speech_bytes = tbl["speech_bytes"][local_i].as_py()
+        transcript_bytes = tbl["transcript_bytes"][local_i].as_py()
+        del tbl  # 尽快释放本行组解压后的 Table，降低峰值内存
         if speech_bytes is None or transcript_bytes is None:
             return None
 
@@ -247,7 +312,13 @@ class PretrainDataset(Dataset):
             return None
         speech_tensor, speech_lengths = speech_result
 
-        prompt = self.create_chat_prompt(transcript)
+        mel_len = int(speech_lengths.item())
+        encoder_len = mel_len // 2
+        n_speech_tokens = num_speech_tokens_from_encoder_length(encoder_len)
+        if n_speech_tokens <= 0:
+            return None
+
+        prompt = self.create_chat_prompt(transcript, n_speech_tokens)
         input_ids = self.tokenizer(prompt).input_ids[: self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
         labels = self.generate_labels(input_ids)

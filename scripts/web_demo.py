@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from model.model_olm import MiniMindOLM, OLMConfig  # noqa: E402
+from model.model_olm import MiniMindOLM, OLMConfig, num_speech_tokens_from_encoder_length  # noqa: E402
 from trainer.trainer_utils import get_model_params, setup_seed  # noqa: E402
 
 warnings.filterwarnings('ignore')
@@ -49,7 +49,13 @@ def init_model(args):
     return model.eval().to(args.device), tokenizer, preprocess
 
 
-def build_prompt(model, text_prompt: str, with_image: bool = False, with_speech: bool = False) -> str:
+def build_prompt(
+    model,
+    text_prompt: str,
+    with_image: bool = False,
+    with_speech: bool = False,
+    n_speech_tokens: int = 0,
+) -> str:
     prompt = (text_prompt or '').strip()
     if with_image and '<image>' not in prompt:
         prompt = (prompt + '\n<image>').strip()
@@ -57,7 +63,11 @@ def build_prompt(model, text_prompt: str, with_image: bool = False, with_speech:
         prompt = (prompt + '\n<speech>').strip()
 
     prompt = prompt.replace('<image>', model.params.image_special_token)
-    prompt = prompt.replace('<speech>', model.params.speech_special_token)
+    if with_speech:
+        if n_speech_tokens > 0:
+            prompt = prompt.replace('<speech>', '#' * n_speech_tokens)
+        else:
+            prompt = prompt.replace('<speech>', '')
     return prompt
 
 
@@ -90,15 +100,25 @@ def predict(user_text, image, audio_path, history, max_new_tokens, temperature, 
 
     speech_values = None
     speech_lengths = None
+    n_speech_tokens = 0
     if has_audio:
         if MODEL.speech_encoder is None:
             raise gr.Error('未加载语音编码器，无法处理音频。')
         speech_tensor = MiniMindOLM.speech2tensor(audio_path)
-        speech_values = speech_tensor.unsqueeze(0).unsqueeze(0).to(ARGS.device)
-        speech_lengths = torch.LongTensor([[speech_tensor.size(0)]]).to(ARGS.device)
+        enc_len = speech_tensor.size(0) // 2
+        n_speech_tokens = num_speech_tokens_from_encoder_length(enc_len)
+        if n_speech_tokens > 0:
+            speech_values = speech_tensor.unsqueeze(0).unsqueeze(0).to(ARGS.device)
+            speech_lengths = torch.LongTensor([[speech_tensor.size(0)]]).to(ARGS.device)
 
     raw_text = (user_text or '').strip()
-    prompt = build_prompt(MODEL, raw_text, with_image=has_image, with_speech=has_audio)
+    prompt = build_prompt(
+        MODEL,
+        raw_text,
+        with_image=has_image,
+        with_speech=has_audio,
+        n_speech_tokens=n_speech_tokens,
+    )
 
     messages = build_history_messages(history)
     messages.append({'role': 'user', 'content': prompt})

@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 from transformers import AutoTokenizer
 
-from model.model_olm import MiniMindOLM, OLMConfig
+from model.model_olm import MiniMindOLM, OLMConfig, num_speech_tokens_from_encoder_length
 from trainer.trainer_utils import setup_seed, get_model_params
 
 warnings.filterwarnings('ignore')
@@ -334,7 +334,7 @@ def init_model(args):
     return model.eval().to(args.device), tokenizer, preprocess
 
 
-def build_prompt(model, text_prompt, with_image=False, with_speech=False):
+def build_prompt(model, text_prompt, with_image=False, with_speech=False, n_speech_tokens: int = 0):
     prompt = text_prompt
     if with_image and '<image>' not in prompt:
         prompt = prompt + "\n<image>"
@@ -342,7 +342,11 @@ def build_prompt(model, text_prompt, with_image=False, with_speech=False):
         prompt = prompt + "\n<speech>"
 
     prompt = prompt.replace('<image>', model.params.image_special_token)
-    prompt = prompt.replace('<speech>', model.params.speech_special_token)
+    if with_speech:
+        if n_speech_tokens > 0:
+            prompt = prompt.replace('<speech>', '#' * n_speech_tokens)
+        else:
+            prompt = prompt.replace('<speech>', '')
     return prompt
 
 
@@ -486,19 +490,31 @@ def main():
 
     speech_values = None
     speech_lengths = None
+    n_speech_tokens = 0
+    enc_len = 0
     if args.mode in {"speech", "both"}:
         if not args.audio_path or not os.path.exists(args.audio_path):
             raise FileNotFoundError(f"mode={args.mode} 需要存在的 --audio_path")
         speech_tensor = MiniMindOLM.speech2tensor(args.audio_path)
-        speech_values = speech_tensor.unsqueeze(0).unsqueeze(0).to(args.device)
-        speech_lengths = torch.LongTensor([[speech_tensor.size(0)]]).to(args.device)
+        enc_len = speech_tensor.size(0) // 2
+        n_speech_tokens = num_speech_tokens_from_encoder_length(enc_len)
+        if n_speech_tokens > 0:
+            speech_values = speech_tensor.unsqueeze(0).unsqueeze(0).to(args.device)
+            speech_lengths = torch.LongTensor([[speech_tensor.size(0)]]).to(args.device)
 
     prompt = build_prompt(
         model,
         args.prompt,
         with_image=pixel_values is not None,
-        with_speech=speech_values is not None,
+        with_speech=(args.mode in {"speech", "both"}),
+        n_speech_tokens=n_speech_tokens,
     )
+    if args.mode in {"speech", "both"}:
+        print(
+            f"[Speech] mel 时间维 T={speech_tensor.size(0)}, encoder 有效帧 P={enc_len} "
+            f"→ 语音 token 数 N={n_speech_tokens}"
+            + ("（P<10 无语音 token，仅文本）" if n_speech_tokens == 0 else "")
+        )
     messages = [{"role": "user", "content": prompt}]
     inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(inputs_text, return_tensors="pt", truncation=True).to(args.device)

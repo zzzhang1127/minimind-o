@@ -96,6 +96,8 @@ strict=False 的意义：
 
 MiniMind-O 训练读取 Parquet，推荐用 build_olm_parquet.py 从 JSONL 构建。
 
+**大数据集（多 GB）**：`PretrainDataset` 按 **row group** 按需读取，不会整表 `read_table`；可将 `--data_path` 指向**目录**（该目录下所有 `*.parquet`）或 **通配**（如 `data/shard_*.parquet`）。若单文件只有一个超大 row group，生成数据时请控制分片/行组大小，详见 `DATA_FLOW_GUIDE.md`。
+
 ### 3.1 JSONL 输入格式
 
 每行一个 JSON 样本，推荐字段：
@@ -180,13 +182,13 @@ python dataset/build_olm_parquet.py \
 
 ### 4.1 阶段A：语音优先预训练
 
-建议先进入 trainer 目录执行，避免默认相对路径跑偏：
+建议先进入 trainer 目录执行（与脚本内部逻辑一致：`train_pretrain_olm.py` / `train_sft_olm.py` 启动时会 **自动 `cd` 到 `trainer/`**，默认 `../out`、`../dataset/...` 均相对仓库根目录）。
 
 ~~~powershell
 cd trainer
 ~~~
 
-命令示例：
+命令示例（可省略与默认相同的 `--save_dir`、`--data_path`）：
 
 ~~~powershell
 python train_pretrain_olm.py ^
