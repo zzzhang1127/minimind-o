@@ -53,7 +53,6 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 - `pyarrow`（Parquet 读写）
 - `pillow`（图像处理）
 - `openai-whisper` / `transformers` 相关依赖（Whisper 特征/模型加载）
-- `gradio`（如需界面化演示）
 
 ## 模型文件准备
 
@@ -137,7 +136,7 @@ python train_pretrain_olm.py --use_compile 1 --use_wandb
 ### 性能/稳定性提示（实践经验）
 
 - 本地训练时，`num_workers > 1` 可能导致主机内存占用激增而 OOM（因此脚本默认 `--num_workers 0`）
-- 云端训练时，即使 CPU 打满，GPU 利用率仍可能剧烈波动；常见原因是数据解码与特征提取（WAV 解码、mel 计算、Parquet row-group 解压）开销较大，导致 GPU 等待数据
+- 云端训练时，即使 CPU 打满，GPU 利用率仍可能剧烈波动；常见原因是数据解码与特征提取（WAV 解码、mel 计算、Parquet row-group 解压）开销很大，导致 GPU 等待数据
 
 ## 推理评估（speech / vision / both）
 
@@ -156,7 +155,7 @@ python eval_olm.py \
   --prompt "这段语音说了什么？"
 ```
 
-你观测到的典型输出（节选）：
+运行后控制台典型日志（节选）：
 
 ```text
 Model Params: 105.02M
@@ -165,10 +164,29 @@ Trainable Params: 105.016M (same counting scope as total; excludes frozen vision
 Prompt: 这段语音说了什么？
 Answer:
 [Speed]: 19.38 tokens/s
-...
 ```
 
-现象：模型能大致转录/理解语音主旨，但句末可能出现重复或不稳定。
+**示例 1（与上述命令一致）**
+
+- **音频**：`dataset/eval_speeches/我们那边有大海，然后天气也很好，空气也很好，就是夏天的时候特别热，北京夏天热吗？.wav`
+- **提示**：`这段语音说了什么？`
+- **模型输出**：
+
+```text
+我们那边有大海，然后天气很好，空中很漂亮，就是下午的时候特别热，北京北京北京北京火车嘛。
+```
+
+**示例 2**
+
+- **语音内容（大意）**：我平常挺喜欢运动，每周大概去三四次健身房，也会游泳，但已经很久没游了，想过段时间把习惯捡回来。
+- **音频文件名**：可置于 `dataset/eval_speeches/` 下任意 `.wav`（内容对应上述描述即可）。
+- **模型输出**：
+
+```text
+我平常的话听起来挺喜欢去运动的，我每周我可能会去三次或者四次健身房，然后会去游泳，但是已经好久没有游泳了。所以可能时间也 得在吧，所以可能过于有游泳了。所以可能过于浪费了。所以可能过于浪费了。
+```
+
+小结：模型能大致读懂语音含义并完成转述，但句末可能出现重复、措辞漂移或不稳定；长句尾部尤需注意。
 
 ### 视觉模式（vision，可选）
 
@@ -284,8 +302,6 @@ minimind-o/
     speech_model/whisper-base/               # git clone 下载
     vision_model/clip-vit-base-patch16/      # git clone 下载（可选）
   dataset/
-    short_wav/                               # CS-Dialogue short_wav 解压目录
-    build_pretrain_parquet.py                # short_wav -> pretrain_s2t.parquet
     pretrain_dataset.py                      # Parquet 读取 + 语音特征提取 + prompt/labels 构造
     pretrain_s2t.parquet                     # 生成后的训练数据
     eval_speeches/                           # 推理用语音样例
@@ -299,4 +315,11 @@ minimind-o/
   eval_olm.py                                # 推理脚本
   requirements.txt
 ```
+
+## 致谢
+
+- 语言模型与训练范式来自 [jingyaogong/minimind](https://github.com/jingyaogong/minimind)。
+- 视觉多模态基座与工程习惯来自 [jingyaogong/minimind-v](https://github.com/jingyaogong/minimind-v)，预训练对齐使用的 `pytorch_model.bin` 来自 [jingyaogong/MiniMind2-V](https://huggingface.co/jingyaogong/MiniMind2-V)。
+- 语音预训练数据来自 [BAAI/CS-Dialogue](https://huggingface.co/datasets/BAAI/CS-Dialogue)。
+- 语音编码与特征提取基于 [openai/whisper-base](https://huggingface.co/openai/whisper-base)；视觉编码（可选）基于 [openai/clip-vit-base-patch16](https://huggingface.co/openai/clip-vit-base-patch16)。
 
