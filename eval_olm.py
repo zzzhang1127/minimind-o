@@ -420,7 +420,7 @@ def _validate_mode_inputs(args, repo_dir: Path):
 def main():
     repo_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="MiniMind-O Eval")
-    parser.add_argument('--mode', choices=["text", "vision", "speech", "both"], default="vision", type=str)
+    parser.add_argument('--mode', choices=["text", "vision", "speech", "both"], default="speech", type=str)
     parser.add_argument(
         '--load_from',
         default=str(repo_dir / "out"),

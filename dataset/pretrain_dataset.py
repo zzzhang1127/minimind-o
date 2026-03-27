@@ -104,7 +104,6 @@ class PretrainDataset(Dataset):
         fallback_speech_T: int = 3000,
         enable_spec_augment: bool = True,
         enable_wave_augment: bool = True,
-        # 以下为兼容旧调用（如 train_sft_olm / validate_data_flow），语音预训练不使用图像与 CLIP
         preprocess=None,
         image_special_token=None,
     ):

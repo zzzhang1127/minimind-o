@@ -169,7 +169,7 @@ if __name__ == "__main__":
         help="初始权重：在 save_dir 下查找 {prefix}.pth/.bin（默认 pytorch_model → out/pytorch_model.bin，"
         "建议使用已含 vision_proj 的多模态基座，如从 minimind-v MiniMind2-V 复制到 out/）",
     )
-    parser.add_argument("--epochs", type=int, default=10, help="epochs")
+    parser.add_argument("--epochs", type=int, default=5, help="epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument(
         "--lr_speech_proj",
